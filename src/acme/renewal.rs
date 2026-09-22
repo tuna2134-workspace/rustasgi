@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use instant_acme::{ChallengeType, Identifier, NewOrder, OrderStatus};
+use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+use x509_parser::prelude::*;
 
 use crate::tls::{ChallengeStore, TlsState};
 
@@ -46,7 +48,6 @@ pub fn should_renew(cert_path: &Path, threshold_days: u64) -> Result<bool, Strin
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("parse cert: {e}"))?;
     let first = certs.first().ok_or("no cert")?;
-    use x509_parser::prelude::*;
     let (_, cert) =
         X509Certificate::from_der(first.as_ref()).map_err(|e| format!("x509 parse: {e}"))?;
     let not_after = cert.validity().not_after;
@@ -63,7 +64,6 @@ pub fn should_renew(cert_path: &Path, threshold_days: u64) -> Result<bool, Strin
 
 /// Generate self-signed cert for domains (mock ACME issuance for tests and fallback)
 pub fn generate_self_signed(domains: &[String]) -> Result<(Vec<u8>, Vec<u8>), String> {
-    use rcgen::{CertificateParams, DistinguishedName, KeyPair};
     let mut params =
         CertificateParams::new(domains.to_vec()).map_err(|e| format!("params: {e}"))?;
     params.distinguished_name = DistinguishedName::new();
@@ -94,32 +94,21 @@ pub fn renew_self_signed(
 }
 
 /// Background renewal task
-#[allow(dead_code)]
-pub struct RenewalTask {
-    shutdown_tx: watch::Sender<bool>,
-}
+pub struct RenewalTask;
 
-#[allow(dead_code)]
 impl RenewalTask {
     pub fn spawn(
         config: AcmeConfig,
         tls_state: Arc<TlsState>,
         challenge_store: ChallengeStore,
     ) -> Self {
-        let (tx, mut rx) = watch::channel(false);
         let tls_clone = tls_state.clone();
         let challenge_clone = challenge_store.clone();
         tokio::spawn(async move {
             // Initial delay to avoid blocking startup
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(3600)) => {},
-                    _ = rx.changed() => {
-                        eprintln!("INFO rustwasgi: ACME renewal task shutting down");
-                        break;
-                    }
-                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
                 let cert_path = config.storage_dir.join("cert.pem");
                 let key_path = config.storage_dir.join("key.pem");
                 let needs = if cert_path.exists() {
@@ -170,11 +159,7 @@ impl RenewalTask {
                 }
             }
         });
-        Self { shutdown_tx: tx }
-    }
-
-    pub fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        Self
     }
 }
 

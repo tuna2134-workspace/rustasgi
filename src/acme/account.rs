@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -75,9 +75,4 @@ pub async fn load_or_create_account(
         account_path.display()
     );
     Ok(account)
-}
-
-#[allow(dead_code)]
-pub fn account_storage_path(acme_dir: &Path) -> PathBuf {
-    acme_dir.join("account.json")
 }
