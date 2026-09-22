@@ -22,11 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="rustwasgi", description="Rust (hyper) ASGI server"
     )
     p.add_argument("app", help="ASGI app, e.g. 'app:app'")
-    p.add_argument("--host", default=env("HOST", "127.0.0.1"))
-    p.add_argument("--port", type=int, default=int(env("PORT", "8000")))
-    p.add_argument("--workers", type=int, default=int(env("WORKERS", "1")))
+    p.add_argument("--host", default=env("HOST", "127.0.0.1"), short="-h")
+    p.add_argument("--port", type=int, default=int(env("PORT", "8000")), short="-p")
+    p.add_argument("--workers", type=int, default=int(env("WORKERS", "1")), short="-w")
     p.add_argument("--log-level", default=env("LOG_LEVEL", "info"))
-    p.add_argument("--root-path", default=env("ROOT_PATH", ""))
+    p.add_argument("--root-path", default=env("ROOT_PATH", ""), short="-r")
     p.add_argument(
         "--lifespan",
         default=env("LIFESPAN", "auto"),
