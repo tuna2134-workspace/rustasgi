@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use rustls::pki_types::ServerName;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -32,16 +31,6 @@ impl SniResolver {
     pub fn set_default(&mut self, ck: CertifiedKey) {
         self.default = Some(Arc::new(ck));
     }
-
-    #[allow(dead_code)]
-    pub fn into_inner(self) -> Self {
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn into_reloadable(self, _has_default: bool) -> ReloadableResolver {
-        ReloadableResolver::new(self)
-    }
 }
 
 impl ResolvesServerCert for SniResolver {
@@ -55,32 +44,4 @@ impl ResolvesServerCert for SniResolver {
     }
 }
 
-/// Reloadable resolver wrapping ArcSwap for atomic reload without restart
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct ReloadableResolver {
-    inner: Arc<ArcSwap<SniResolver>>,
-}
 
-#[allow(dead_code)]
-impl ReloadableResolver {
-    pub fn new(initial: SniResolver) -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::from_pointee(initial)),
-        }
-    }
-
-    pub fn reload(&self, new_resolver: SniResolver) {
-        self.inner.store(Arc::new(new_resolver));
-    }
-
-    pub fn get(&self) -> Arc<SniResolver> {
-        self.inner.load_full()
-    }
-}
-
-impl ResolvesServerCert for ReloadableResolver {
-    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.inner.load().resolve(client_hello)
-    }
-}

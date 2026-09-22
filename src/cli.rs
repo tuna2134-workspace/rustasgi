@@ -83,11 +83,6 @@ impl ServerConfig {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn is_tls_enabled(&self) -> bool {
-        (self.tls_cert.is_some() && self.tls_key.is_some()) || !self.tls_sni.is_empty()
-    }
-
     pub fn is_acme_enabled(&self) -> bool {
         !self.acme_domains.is_empty() && self.acme_email.is_some()
     }

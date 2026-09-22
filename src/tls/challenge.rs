@@ -33,11 +33,6 @@ impl ChallengeStore {
         self.inner.write().unwrap().remove(token);
         eprintln!("INFO rustwasgi: ACME challenge removed");
     }
-
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        self.inner.write().unwrap().clear();
-    }
 }
 
 pub fn is_valid_token(token: &str) -> bool {

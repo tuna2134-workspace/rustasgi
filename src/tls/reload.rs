@@ -17,16 +17,6 @@ pub struct TlsState {
 }
 
 impl TlsState {
-    #[allow(dead_code)]
-    pub fn new(config: ServerConfig) -> Self {
-        Self {
-            config: Arc::new(ArcSwap::from_pointee(config)),
-            cert_count: 1,
-            cert_path: None,
-            key_path: None,
-        }
-    }
-
     pub fn from_pem_files(cert_path: &Path, key_path: &Path) -> Result<Self, crate::tls::TlsError> {
         let cfg = crate::tls::config::build_single_config(cert_path, key_path)?;
         Ok(Self {
@@ -83,20 +73,4 @@ impl TlsState {
     }
 }
 
-/// Helper for atomic cert install - writes to temp then rename
-#[allow(dead_code)]
-pub struct TlsReloader {
-    pub state: Arc<TlsState>,
-}
 
-#[allow(dead_code)]
-impl TlsReloader {
-    pub fn new(state: Arc<TlsState>) -> Self {
-        Self { state }
-    }
-
-    pub fn reload(&self, new_config: ServerConfig) {
-        self.state.reload(new_config);
-        eprintln!("INFO rustwasgi: certificate reload: new config installed");
-    }
-}

@@ -33,30 +33,6 @@ pub enum TlsError {
     Rustls(String),
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct TlsConfig {
-    pub cert_path: Option<PathBuf>,
-    pub key_path: Option<PathBuf>,
-    /// SNI entries: domain -> (cert_path, key_path)
-    pub sni_entries: Vec<(String, PathBuf, PathBuf)>,
-}
-
-#[allow(dead_code)]
-impl TlsConfig {
-    pub fn single(cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
-        Self {
-            cert_path: Some(cert.into()),
-            key_path: Some(key.into()),
-            sni_entries: Vec::new(),
-        }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.cert_path.is_some() && self.key_path.is_some() || !self.sni_entries.is_empty()
-    }
-}
-
 pub fn load_cert_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let file = File::open(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
