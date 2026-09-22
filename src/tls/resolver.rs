@@ -43,5 +43,3 @@ impl ResolvesServerCert for SniResolver {
         self.default.clone()
     }
 }
-
-

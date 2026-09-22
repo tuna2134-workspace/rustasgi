@@ -173,7 +173,6 @@ async fn try_acme_issuance(
     // Load or create account
     // For brevity, use instant_acme with directory_url
     // This is a simplified flow that handles Http01 only
-    use instant_acme::{ChallengeType, Identifier, NewOrder, OrderStatus};
     let account = crate::acme::account::load_or_create_account(
         &config.storage_dir,
         &config.email,

@@ -1,6 +1,9 @@
 use std::fs::{self, File};
+use std::io::Cursor;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+
+use x509_parser::prelude::*;
 
 use crate::tls::TlsState;
 
@@ -65,7 +68,6 @@ pub fn atomic_install(
 }
 
 fn validate_pem_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), String> {
-    use std::io::Cursor;
     let certs = rustls_pemfile::certs(&mut Cursor::new(cert_pem))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("cert parse: {e}"))?;
@@ -78,7 +80,6 @@ fn validate_pem_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), String> {
     crate::tls::config::validate_pair(&certs, &key).map_err(|e| e.to_string())?;
     // Check SAN and expiry via x509-parser
     if let Some(first) = certs.first() {
-        use x509_parser::prelude::*;
         if let Ok((_, cert)) = X509Certificate::from_der(first.as_ref()) {
             let _ = cert.subject();
         } else {

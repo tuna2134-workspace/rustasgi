@@ -72,5 +72,3 @@ impl TlsState {
         Ok(())
     }
 }
-
-

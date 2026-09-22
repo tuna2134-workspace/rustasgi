@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ServerConfig;
+use x509_parser::prelude::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -149,12 +150,11 @@ pub fn validate_pair(
     ck.keys_match()
         .map_err(|e| TlsError::KeyMismatch(e.to_string()))?;
     // Check SAN / validity via x509-parser
-    if let Some(first) = certs.first() {
-        use x509_parser::prelude::*;
-        if let Ok((_, cert)) = X509Certificate::from_der(first.as_ref()) {
-            // Basic validity check - ensure cert has subject
-            let _ = cert.subject();
-        }
+    if let Some(first) = certs.first()
+        && let Ok((_, cert)) = X509Certificate::from_der(first.as_ref())
+    {
+        // Basic validity check - ensure cert has subject
+        let _ = cert.subject();
     }
     Ok(())
 }

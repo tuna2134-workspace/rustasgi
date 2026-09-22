@@ -603,7 +603,6 @@ async fn heartbeat_loop(state: Arc<AppState>, shutdown: Arc<Shutdown>) {
 }
 
 async fn cert_watcher(tls: std::sync::Arc<crate::tls::TlsState>, shutdown: Arc<Shutdown>) {
-    use std::time::Duration;
     let cert_path = match &tls.cert_path {
         Some(p) => p.clone(),
         None => return,
