@@ -46,17 +46,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    rustwasgi.run(
-        args.app,
-        host=args.host,
-        port=args.port,
-        workers=args.workers,
-        log_level=args.log_level,
-        root_path=args.root_path,
-        lifespan=args.lifespan,
-        access_log=args.access_log,
-        keep_alive=args.keep_alive,
-    )
+    try:
+        rustwasgi.run(
+            args.app,
+            host=args.host,
+            port=args.port,
+            workers=args.workers,
+            log_level=args.log_level,
+            root_path=args.root_path,
+            lifespan=args.lifespan,
+            access_log=args.access_log,
+            keep_alive=args.keep_alive,
+        )
+    except KeyboardInterrupt:
+        # SIGINT is already handled gracefully by the Rust runtime (quick
+        # shutdown via its own signal watcher); the interpreter may still
+        # deliver KeyboardInterrupt to this thread while it re-acquires the
+        # GIL during teardown. Swallow it so Ctrl-C exits silently with 0
+        # instead of dumping a traceback for a shutdown that already happened.
+        pass
 
 
 if __name__ == "__main__":

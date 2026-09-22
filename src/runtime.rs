@@ -5,10 +5,9 @@
 //! Each worker process owns exactly one asyncio event loop, created on the
 //! calling thread with `asyncio.new_event_loop()` (construction needs no
 //! running loop) and driven by one dedicated OS thread running
-//! `loop.run_forever()`. There is deliberately NO startup handshake channel:
-//! creating the loop object requires no I/O, and scheduling work onto it is
-//! race-free by construction (queue-based), so the parent never blocks
-//! waiting for the child.
+//! `loop.run_forever()`. Startup synchronizes on the loop actually running
+//! (poll rendezvous, GIL released while waiting) so the first bridge calls
+//! never observe a not-yet-started loop.
 //!
 //! Cross-thread interaction uses ONLY `pyo3-async-runtimes`:
 //!
@@ -90,8 +89,15 @@ pub fn import_app(py: Python<'_>, spec: &str) -> PyResult<Py<PyAny>> {
 ///
 /// The loop object is created HERE (no running loop needed for construction)
 /// and `TaskLocals` is pinned to it, so `into_future_with_locals` works from
-/// any thread with no startup synchronization at all. The spawned thread sets
-/// the loop for itself and drives it; it exits when the loop is stopped.
+/// any thread. The spawned thread sets the loop for itself and drives it;
+/// it exits when the loop is stopped.
+///
+/// This returns as soon as the thread is spawned — use
+/// [`wait_loop_running`] (once a Tokio runtime exists) to rendezvous on the
+/// loop actually running before the first bridge submission. Without that,
+/// early `into_future` calls would observe `is_running() == false` and
+/// wrongly conclude the loop is *stopping* — flaky under fork/load, where
+/// the child thread is slow to start.
 pub fn start_asyncio_loop(py: Python<'_>) -> PyResult<LoopHandle> {
     let asyncio = py.import("asyncio")?;
     let loop_obj: Py<PyAny> = asyncio.call_method0("new_event_loop")?.unbind();
@@ -126,10 +132,49 @@ pub fn start_asyncio_loop(py: Python<'_>) -> PyResult<LoopHandle> {
                 "failed to spawn asyncio thread: {e}"
             ))
         })?;
+
     Ok(LoopHandle {
         loop_obj,
         locals,
         join_handle: Some(handle),
+    })
+}
+
+/// Wait until the loop thread has actually entered `run_forever`.
+///
+/// Must be called after a Tokio runtime exists (uses its timer) and before
+/// the first bridge submission. Each poll holds the GIL only for one
+/// attribute call; the sleeps are async and hold no GIL, and this itself
+/// runs with the GIL released — so the child thread is never starved by
+/// this wait, and no OS thread is ever blocked on Python.
+pub fn wait_loop_running(
+    py: Python<'_>,
+    rt: &tokio::runtime::Runtime,
+    loop_obj: &Py<PyAny>,
+) -> PyResult<()> {
+    let loop_c = loop_obj.clone_ref(py);
+    py.detach(|| {
+        rt.block_on(async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let running = Python::attach(|py| {
+                    loop_c
+                        .bind(py)
+                        .call_method0("is_running")
+                        .and_then(|v| v.extract::<bool>())
+                        .unwrap_or(false)
+                });
+                if running {
+                    return Ok(());
+                }
+                if tokio::time::Instant::now() > deadline {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "asyncio loop thread did not start within 10s",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
     })
 }
 
@@ -139,6 +184,12 @@ pub fn start_asyncio_loop(py: Python<'_>) -> PyResult<LoopHandle> {
 /// threadsafe call left in our code, used solely for shutdown (never on the
 /// request path). Callers joining the loop thread MUST release the GIL while
 /// joining (the thread needs it to run the stop callback).
+///
+/// KeyboardInterrupt transparency: our own signal watcher already drives
+/// shutdown, so a KI raised by the interpreter inside this attach must not
+/// be swallowed (that would lose the stop and hang the join) nor abort the
+/// shutdown — retry the schedule instead. A single ^C raises exactly once,
+/// so the retry proceeds normally.
 pub fn stop_asyncio_loop(loop_obj: &Py<PyAny>) {
     Python::attach(|py| {
         let running: bool = loop_obj
@@ -146,8 +197,23 @@ pub fn stop_asyncio_loop(loop_obj: &Py<PyAny>) {
             .call_method0("is_running")
             .and_then(|v| v.extract())
             .unwrap_or(false);
-        if running && let Ok(stop) = loop_obj.getattr(py, "stop") {
-            let _ = loop_obj.call_method1(py, "call_soon_threadsafe", (stop,));
+        if !running {
+            return;
+        }
+        let Ok(stop) = loop_obj.getattr(py, "stop") else {
+            return;
+        };
+        for _ in 0..3 {
+            let stop_ref = stop.clone_ref(py);
+            match loop_obj.call_method1(py, "call_soon_threadsafe", (stop_ref,)) {
+                Ok(_) => return,
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) => {
+                    // Signal consumed by the raise; shutdown is already in
+                    // progress via the Rust watcher — retry the schedule.
+                    continue;
+                }
+                Err(_) => return,
+            }
         }
     });
 }

@@ -79,10 +79,11 @@ fn run(
     let notify: Py<PyAny> = py.eval(c"lambda: None", None, None)?.unbind();
     let is_alive: Py<PyAny> = py.eval(c"lambda: True", None, None)?.unbind();
 
-    let (app_obj, loop_handle, bridge) = setup_python(py, &app)?;
+    let (app_obj, bridge) = setup_python(py, &app)?;
     config.log_info(&format!("loaded ASGI application {app}"));
     // Build the serving runtime first: standalone sockets must be bound on
-    // the same runtime that serves them (Tokio I/O is runtime-bound).
+    // the same runtime that serves them (Tokio I/O is runtime-bound), and
+    // the loop-startup rendezvous needs its timer.
     let rt_owned = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(tokio_worker_threads())
@@ -93,6 +94,8 @@ fn run(
         })?;
     let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt_owned));
     share_runtime(rt);
+    let loop_handle = runtime::start_asyncio_loop(py)?;
+    runtime::wait_loop_running(py, rt, &loop_handle.loop_obj)?;
     let listeners = py
         .detach(|| rt.block_on(socket::bind_standalone(host, port)))
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
@@ -161,9 +164,9 @@ fn run_worker(
     );
     let app_obj = app.clone().unbind();
     let bridge = asgi::Bridge::install(py)?;
-    let loop_handle = runtime::start_asyncio_loop(py)?;
-    // Serving runtime for this (post-fork) worker; inherited FDs become
-    // Tokio listeners *inside* its context (Tokio I/O is runtime-bound).
+    // Serving runtime for this (post-fork) worker; the loop rendezvous below
+    // needs its timer, and inherited FDs become Tokio listeners *inside* its
+    // context (Tokio I/O is runtime-bound).
     let rt_owned = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(tokio_worker_threads())
@@ -174,6 +177,8 @@ fn run_worker(
         })?;
     let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt_owned));
     share_runtime(rt);
+    let loop_handle = runtime::start_asyncio_loop(py)?;
+    runtime::wait_loop_running(py, rt, &loop_handle.loop_obj)?;
     let bound = {
         let _guard = rt.enter();
         socket::bind_inherited(inherited).map_err(pyo3::exceptions::PyRuntimeError::new_err)?
@@ -225,15 +230,12 @@ fn share_runtime(rt: &'static tokio::runtime::Runtime) {
     let _ = pyo3_async_runtimes::tokio::init_with_runtime(rt);
 }
 
-/// Import app + install bridge + start loop (standalone path).
-fn setup_python(
-    py: Python<'_>,
-    app_spec: &str,
-) -> PyResult<(Py<PyAny>, runtime::LoopHandle, asgi::Bridge)> {
+/// Import app + install bridge (standalone path). Loop startup happens after
+/// the Tokio runtime exists so start/stop can rendezvous on it.
+fn setup_python(py: Python<'_>, app_spec: &str) -> PyResult<(Py<PyAny>, asgi::Bridge)> {
     let app_obj = runtime::import_app(py, app_spec)?;
     let bridge = asgi::Bridge::install(py)?;
-    let loop_handle = runtime::start_asyncio_loop(py)?;
-    Ok((app_obj, loop_handle, bridge))
+    Ok((app_obj, bridge))
 }
 
 /// Shared orchestration on the worker runtime: lifespan startup -> serve ->
@@ -340,6 +342,28 @@ fn serve_process_on(
 /// "Task was destroyed but it is pending". Best effort, bounded.
 async fn cancel_pending_tasks(locals: &TaskLocals) {
     let res: Result<(), String> = async {
+        // Barrier first: a no-op round-trip forces the loop to run one full
+        // pass, converting scheduled-but-unrun callbacks (e.g. in-flight
+        // `into_future` submissions) into real Tasks — otherwise they sit in
+        // the loop's ready queue past stop() and their coroutines die with
+        // "was never awaited" warnings at teardown.
+        let barrier = Python::attach(|py| {
+            let code = c"async def _barrier():\n    return None\n";
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                code,
+                c"rustwasgi_barrier.py",
+                c"rustwasgi_barrier",
+            )
+            .map_err(|e| format!("{e}"))?;
+            let coro = module
+                .getattr("_barrier")
+                .map_err(|e| format!("{e}"))?
+                .call0()
+                .map_err(|e| format!("{e}"))?;
+            crate::asgi::into_future(locals, coro).map_err(|e| format!("{e}"))
+        })?;
+        let _ = tokio::time::timeout(Duration::from_secs(5), barrier).await;
         let coro = Python::attach(|py| {
             let asyncio = py.import("asyncio").map_err(|e| format!("{e}"))?;
             // all_tasks() must run ON the loop: wrap in a coroutine.

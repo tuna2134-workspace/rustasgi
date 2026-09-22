@@ -1,7 +1,8 @@
 [package]
 name = "rustwasgi"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
+readme = "README.md"
 
 [lib]
 name = "_rustwasgi"

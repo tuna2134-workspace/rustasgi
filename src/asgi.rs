@@ -444,8 +444,32 @@ impl Bridge {
 /// Convert a Python awaitable into an awaitable Rust future bound to our
 /// loop. The GIL is needed only to build/schedule; the returned future
 /// parks the Tokio task (oneshot/waker) with no threads and no GIL.
+///
+/// Shutdown guard: if the loop is already stopped, scheduling would succeed
+/// but the callable would never run — and dropping the unsent coroutine
+/// later logs "coroutine was never awaited". Fail fast instead, closing the
+/// coroutine explicitly so GC stays silent. (A not-*yet*-started loop is
+/// excluded by construction: `start_asyncio_loop` rendezvous on running
+/// before anyone can submit, so `!running` here genuinely means stopping.)
 pub fn into_future(locals: &TaskLocals, awaitable: Bound<'_, PyAny>) -> PyResult<AppFuture> {
     crate::metrics::inc(crate::metrics::C_INTO_FUTURE);
+    let py = awaitable.py();
+    let running: bool = locals
+        .event_loop(py)
+        .call_method0("is_running")
+        .and_then(|v| v.extract())
+        .unwrap_or(false);
+    if !running {
+        // Never-started coroutine: close() marks it closed so dropping it
+        // is silent. Not all awaitables have close (Tasks/Futures don't need
+        // it — only never-started coroutines trigger the warning).
+        if let Ok(close) = awaitable.getattr("close") {
+            let _ = close.call0();
+        }
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "event loop not running",
+        ));
+    }
     let fut = pyo3_async_runtimes::into_future_with_locals(locals, awaitable)?;
     Ok(Box::pin(fut))
 }
