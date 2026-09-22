@@ -423,7 +423,8 @@ fn connection_builder(keep_alive_secs: u64) -> http1::Builder {
     builder
 }
 
-async fn watch_signals(shutdown: Arc<Shutdown>, mut done: tokio::sync::watch::Receiver<bool>) {
+async fn watch_signals(shutdown: Arc<Shutdown>, done: tokio::sync::watch::Receiver<bool>) {
+    let mut done = done;
     #[cfg(unix)]
     {
         let mut term =

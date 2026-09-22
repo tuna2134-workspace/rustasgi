@@ -110,6 +110,7 @@ impl BoundListener {
     pub fn description(&self) -> &str {
         match self {
             BoundListener::Tcp { description, .. } => description,
+            #[cfg(unix)]
             BoundListener::Unix { description, .. } => description,
         }
     }
