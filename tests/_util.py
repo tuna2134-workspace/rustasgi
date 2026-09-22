@@ -95,15 +95,47 @@ class StdServer:
         )
         wait_for_port(port)
         self.port = port
+        self.is_tls = any("--tls-cert" in str(x) for x in extra)
+
+
+class TlsServer(StdServer):
+    """Standalone TLS server (HTTPS)"""
+
+    def __init__(self, app: str, port: int, cert: str, key: str, extra: tuple = ()):
+        super().__init__(app, port, extra=("--tls-cert", cert, "--tls-key", key, *extra))
+        self.is_tls = True
 
     def request(self, method, path, body=None, headers=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
-        conn.request(method, path, body=body or b"", headers=headers or {})
-        resp = conn.getresponse()
-        data = resp.read()
-        out = (resp.status, resp.getheaders(), data)
-        conn.close()
-        return out
+        # Override to use HTTPS - explicit debug to catch BadStatusLine flake
+        import ssl
+        ctx = ssl._create_unverified_context()
+        # Use same code path as manual successful test: create new context each time
+        conn = http.client.HTTPSConnection("127.0.0.1", self.port, context=ctx, timeout=15)
+        try:
+            conn.request(method, path, body=body or b"", headers=headers or {})
+            resp = conn.getresponse()
+            data = resp.read()
+            out = (resp.status, resp.getheaders(), data)
+            conn.close()
+            return out
+        except Exception as e:
+            # Include port/context debug before re-raising
+            import traceback
+            print(f"DEBUG TlsServer.request failed port={self.port} err={e}", flush=True)
+            traceback.print_exc()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+
+    def get_cert_der(self) -> bytes:
+        import ssl, socket
+        ctx = ssl._create_unverified_context()
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname="localhost") as ssock:
+                der = ssock.getpeercert(binary_form=True)
+                return der if der else b""
 
     def stop(self) -> str:
         self.proc.terminate()

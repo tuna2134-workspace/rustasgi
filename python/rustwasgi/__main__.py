@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--tls-cert", default=env("TLS_CERT", "") or None, help="TLS certificate file (PEM)")
     p.add_argument("--tls-key", default=env("TLS_KEY", "") or None, help="TLS private key file (PEM)")
+    p.add_argument("--tls-sni", dest="tls_sni", action="append", default=None, help="SNI entry as 'domain:cert:key' (repeatable)")
     p.add_argument("--redirect-http-to-https", action=argparse.BooleanOptionalAction, default=env("REDIRECT_HTTP_TO_HTTPS", "0") == "1", help="Redirect HTTP to HTTPS (except ACME challenges)")
     p.add_argument("--acme-directory", default=env("ACME_DIRECTORY", "") or None, help="ACME directory URL (e.g. https://acme-v02.api.letsencrypt.org/directory)")
     p.add_argument("--acme-email", default=env("ACME_EMAIL", "") or None, help="ACME contact email")
@@ -58,6 +59,10 @@ def main(argv: list[str] | None = None) -> None:
     if acme_domains is None:
         env_domains = env("ACME_DOMAINS", "")
         acme_domains = [d.strip() for d in env_domains.split(",") if d.strip()] if env_domains else []
+    tls_sni = args.tls_sni
+    if tls_sni is None:
+        env_sni = env("TLS_SNI", "")
+        tls_sni = [e.strip() for e in env_sni.split(",") if e.strip()] if env_sni else []
     try:
         rustwasgi.run(
             args.app,
@@ -76,6 +81,7 @@ def main(argv: list[str] | None = None) -> None:
             acme_email=args.acme_email,
             acme_domains=acme_domains,
             acme_dir=args.acme_dir,
+            tls_sni=tls_sni,
         )
     except KeyboardInterrupt:
         # SIGINT is already handled gracefully by the Rust runtime (quick

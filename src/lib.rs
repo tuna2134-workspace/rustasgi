@@ -165,7 +165,7 @@ fn run(
 /// `family` is `"tcp4"`, `"tcp6"` or `"unix"`. `notify`/`is_alive` wire the
 /// Gunicorn heartbeat; `access` receives access-log tuples (or `None`).
 #[pyfunction]
-#[pyo3(signature = (app, listeners, *, app_spec="gunicorn", root_path="", lifespan="auto", max_requests=0, graceful_timeout=30, heartbeat_interval=1, access_log=false, keep_alive=0, tls_cert=None, tls_key=None, redirect_http_to_https=false, acme_directory=None, acme_email=None, acme_domains=Vec::new(), acme_dir=None, notify, is_alive, access=None))]
+#[pyo3(signature = (app, listeners, *, app_spec="gunicorn", root_path="", lifespan="auto", max_requests=0, graceful_timeout=30, heartbeat_interval=1, access_log=false, keep_alive=0, tls_cert=None, tls_key=None, redirect_http_to_https=false, acme_directory=None, acme_email=None, acme_domains=Vec::new(), acme_dir=None, tls_sni=Vec::new(), notify, is_alive, access=None))]
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     py: Python<'_>,
@@ -186,6 +186,7 @@ fn run_worker(
     acme_email: Option<String>,
     acme_domains: Vec<String>,
     acme_dir: Option<String>,
+    tls_sni: Vec<String>,
     notify: Py<PyAny>,
     is_alive: Py<PyAny>,
     access: Option<Py<PyAny>>,
@@ -330,8 +331,48 @@ fn serve_process_on(
         locals,
         join_handle,
     } = loop_handle;
-    // TLS setup — outside HTTP path, validated at startup
-    let tls_state = if let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) {
+    // TLS setup — outside HTTP path, validated at startup (SNI aware)
+    let tls_state = if !config.tls_sni.is_empty() {
+        // SNI mode: parse domain:cert:key entries
+        let mut entries: Vec<(String, std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        for entry in &config.tls_sni {
+            let parts: Vec<&str> = entry.splitn(3, ':').collect();
+            if parts.len() != 3 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "invalid --tls-sni '{}', expected 'domain:cert:key'",
+                    entry
+                )));
+            }
+            entries.push((
+                parts[0].to_string(),
+                std::path::PathBuf::from(parts[1]),
+                std::path::PathBuf::from(parts[2]),
+            ));
+        }
+        let default = match (&config.tls_cert, &config.tls_key) {
+            (Some(cert), Some(key)) => Some((
+                std::path::Path::new(cert) as &std::path::Path,
+                std::path::Path::new(key) as &std::path::Path,
+            )),
+            (None, None) => None,
+            _ => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "both --tls-cert and --tls-key must be provided for default cert when using SNI",
+                ))
+            }
+        };
+        match crate::tls::TlsState::from_sni_entries(&entries, default) {
+            Ok(s) => {
+                eprintln!("INFO rustwasgi: TLS SNI enabled ({} certs)", s.cert_count());
+                Some(std::sync::Arc::new(s))
+            }
+            Err(e) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to load SNI certs: {e}"
+                )))
+            }
+        }
+    } else if let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) {
         match crate::tls::TlsState::from_pem_files(std::path::Path::new(cert), std::path::Path::new(key)) {
             Ok(s) => {
                 eprintln!("INFO rustwasgi: TLS enabled cert={cert} key={key}");
