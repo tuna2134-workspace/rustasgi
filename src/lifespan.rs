@@ -1,26 +1,26 @@
 //! ASGI Lifespan protocol (startup/shutdown + state propagation).
 //!
-//! Runs once per worker process, before accepting connections:
+//! Runs once per worker process, before accepting connections, on the SAME
+//! loop and runtime as request processing:
 //!
 //! ```text
-//! submit _call_app(app, {"type": "lifespan", ...}) to the asyncio loop
-//! put {"type": "lifespan.startup"} into the app's queue
-//! wait for {"type": "lifespan.startup.complete" | "lifespan.startup.failed"}
+//! into_future(app(scope=lifespan)) --> app task on the loop
+//! into_future(to_app.put(startup)) --> delivered
+//! race: from_app.get() vs app completion vs timeout
 //!   complete -> capture optional "state" for HTTP/WebSocket scopes
 //!   failed   -> fatal startup error
-//!   app raised / no reply -> "unsupported", server may continue in auto mode
+//!   app exited first / timeout -> unsupported (auto continues, on is fatal)
 //! ... serve ...
-//! put {"type": "lifespan.shutdown"}; wait for complete/failed (best effort)
+//! into_future(to_app.put(shutdown)) / race get vs timeout (best effort)
 //! ```
 //!
-//! All queue operations go through `asyncio.run_coroutine_threadsafe` + a
-//! blocking wait (GIL released while waiting), so no Tokio worker is ever
-//! blocked and the loop thread is never starved.
+//! No threads, no blocking waits: every wait parks the calling task.
 
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyDict};
+use pyo3_async_runtimes::TaskLocals;
 
-use crate::asgi::Bridge;
+use crate::asgi::{Bridge, into_future};
 
 /// How to handle lifespan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +43,7 @@ impl LifespanMode {
 /// Lifespan failure kinds.
 #[derive(Debug)]
 pub enum LifespanError {
-    /// App does not implement lifespan (raised, or stayed silent).
+    /// App does not implement lifespan (raised, exited silently, or timed out).
     /// Fatal only when mode is `on`.
     Unsupported(String),
     /// App explicitly sent `lifespan.startup.failed`. Always fatal.
@@ -59,126 +59,146 @@ impl std::fmt::Display for LifespanError {
     }
 }
 
-const HANDSHAKE_TIMEOUT: f64 = 30.0;
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Manager bound to one worker's app + loop. Created before serving.
+/// Manager bound to one worker's app + loop.
 pub struct LifespanManager {
-    loop_obj: Py<PyAny>,
+    locals: TaskLocals,
     to_app: Option<Py<PyAny>>,
     from_app: Option<Py<PyAny>>,
-    /// The application task; kept alive across the serving lifetime so the
-    /// app's lifespan context (e.g. FastAPI `@asynccontextmanager`) stays
-    /// open until shutdown.
-    _app_future: Option<Py<PyAny>>,
     /// State captured from `lifespan.startup.complete`, shared with scopes.
     pub state: Option<Py<PyAny>>,
 }
 
 impl LifespanManager {
-    /// Run the startup handshake (blocking; GIL released while waiting).
-    /// `bridge`, `loop_obj` and `app` are only borrowed via the GIL token.
-    pub fn startup(
-        py: Python<'_>,
+    /// Run the startup handshake (async; GIL only for construction steps).
+    pub async fn startup(
         bridge: &Bridge,
-        loop_obj: &Py<PyAny>,
+        locals: &TaskLocals,
         app: &Py<PyAny>,
     ) -> Result<Self, LifespanError> {
-        let loop_bound = loop_obj.bind(py);
-
-        // 1. Create queues + receive/send wrappers on the loop thread.
-        let init_coro = bridge.init_lifespan_fn(py).call0().map_err(|e| {
-            e.print(py);
-            LifespanError::Unsupported("could not create lifespan channel".to_string())
-        })?;
-        let init_future = Bridge::submit(py, &loop_bound.clone(), init_coro).map_err(|e| {
-            e.print(py);
-            LifespanError::Unsupported("could not submit lifespan init".to_string())
-        })?;
-        let channel: Bound<'_, PyAny> = init_future
-            .bind(py)
-            .call_method1("result", (10.0,))
-            .map_err(|e| {
+        // 1. Queues + receive/send wrappers, created on the loop.
+        let init_fut = Python::attach(|py| -> Result<_, LifespanError> {
+            let init_coro = bridge.init_lifespan_fn(py).call0().map_err(|e| {
                 e.print(py);
-                LifespanError::Unsupported("lifespan init timed out".to_string())
+                LifespanError::Unsupported("could not create lifespan channel".to_string())
             })?;
-        let (to_app, from_app, receive, send) = channel
-            .extract::<(
-                Bound<'_, PyAny>,
-                Bound<'_, PyAny>,
-                Bound<'_, PyAny>,
-                Bound<'_, PyAny>,
-            )>()
-            .map_err(|e| {
+            into_future(locals, init_coro).map_err(|e| {
                 e.print(py);
-                LifespanError::Unsupported("bad lifespan channel".to_string())
+                LifespanError::Unsupported("could not submit lifespan init".to_string())
+            })
+        })?;
+        let channel = init_fut.await.map_err(|e| {
+            Python::attach(|py| e.print(py));
+            LifespanError::Unsupported("lifespan init failed".to_string())
+        })?;
+        let (to_app, from_app, receive, send): (Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>) =
+            Python::attach(|py| -> Result<_, LifespanError> {
+                channel
+                    .bind(py)
+                    .extract::<(Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>)>()
+                    .map_err(|e| {
+                        e.print(py);
+                        LifespanError::Unsupported("bad lifespan channel".to_string())
+                    })
             })?;
-        let (to_app, from_app) = (to_app.unbind(), from_app.unbind());
 
         // 2. Submit the application with a lifespan scope.
-        let scope = PyDict::new(py);
-        scope
-            .set_item("type", "lifespan")
-            .and_then(|_| {
-                scope.set_item(
-                    "asgi",
-                    [("version", "3.0"), ("spec_version", "2.5")].into_py_dict(py)?,
-                )
+        let app_fut = Python::attach(|py| -> Result<_, LifespanError> {
+            let scope = PyDict::new(py);
+            scope
+                .set_item("type", "lifespan")
+                .and_then(|_| {
+                    scope.set_item(
+                        "asgi",
+                        [("version", "3.0"), ("spec_version", "2.5")].into_py_dict(py)?,
+                    )
+                })
+                .and_then(|_| scope.set_item("state", PyDict::new(py)))
+                .map_err(|e| {
+                    e.print(py);
+                    LifespanError::Unsupported("could not build lifespan scope".to_string())
+                })?;
+            let app_coro = bridge
+                .call_app_fn(py)
+                .call1((app.bind(py), scope, receive.bind(py), send.bind(py)))
+                .map_err(|e| {
+                    e.print(py);
+                    LifespanError::Unsupported("could not call lifespan app".to_string())
+                })?;
+            into_future(locals, app_coro).map_err(|e| {
+                e.print(py);
+                LifespanError::Unsupported("could not submit lifespan app".to_string())
             })
-            .and_then(|_| scope.set_item("state", PyDict::new(py)))
-            .map_err(|e| {
-                e.print(py);
-                LifespanError::Unsupported("could not build lifespan scope".to_string())
-            })?;
-        let app_coro = bridge
-            .call_app_fn(py)
-            .call1((app.bind(py), scope, receive, send))
-            .map_err(|e| {
-                e.print(py);
-                LifespanError::Unsupported("could not call lifespan app".to_string())
-            })?;
-        let app_future = Bridge::submit(py, loop_bound, app_coro).map_err(|e| {
-            e.print(py);
-            LifespanError::Unsupported("could not submit lifespan app".to_string())
         })?;
+        let mut app_fut = app_fut;
 
-        // 3. Send lifespan.startup, wait for the reply.
-        let mut mgr = Self {
-            loop_obj: loop_obj.clone_ref(py),
-            to_app: Some(to_app.clone_ref(py)),
-            from_app: Some(from_app.clone_ref(py)),
-            _app_future: Some(app_future.clone_ref(py)),
-            state: None,
+        // 3. Deliver lifespan.startup.
+        Self::queue_put(locals, &to_app, "lifespan.startup")
+            .await
+            .map_err(LifespanError::Unsupported)?;
+
+        // 4. Race the reply against early app exit and the timeout. An app
+        // that raises/returns without answering is "unsupported", detected
+        // as soon as its task ends — no full-timeout penalty.
+        let get_fut = Self::queue_get(locals, &from_app);
+        tokio::pin!(get_fut);
+        let reply = tokio::select! {
+            biased;
+            r = &mut get_fut => Some(r),
+            // The app exiting without answering MEANS "no lifespan support"
+            // (e.g. a scope-type assert in a pure-HTTP app). That is routine,
+            // not an error: one line, no traceback.
+            r = &mut app_fut => {
+                match r {
+                    Ok(_) => eprintln!(
+                        "INFO rustwasgi: lifespan app exited without replying (unsupported)"
+                    ),
+                    Err(e) => {
+                        let name = Python::attach(|py| {
+                            e.get_type(py)
+                                .name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|_| "?".to_string())
+                        });
+                        eprintln!(
+                            "INFO rustwasgi: lifespan app raised {name} without replying (unsupported)"
+                        );
+                    }
+                }
+                None
+            }
+            _ = tokio::time::sleep(HANDSHAKE_TIMEOUT) => None,
         };
-        // (app_future clone above keeps the task referenced from Rust too.)
-        let _ = app_future;
-        if let Err(msg) = Self::queue_put(py, &mgr.loop_obj, &to_app, "lifespan.startup") {
-            return Err(LifespanError::Unsupported(msg));
-        }
-        // Wait for the reply, but fail fast when the app task already exited
-        // (raised/returned without answering): that means "no lifespan
-        // support" and must not cost the full handshake timeout.
-        match Self::wait_startup_reply(py, &mgr.loop_obj, &from_app, &app_future) {
-            Ok(msg) => {
-                let msg_type: String = msg
-                    .bind(py)
-                    .get_item("type")
-                    .ok()
-                    .and_then(|v| v.extract().ok())
-                    .unwrap_or_default();
+        match reply {
+            Some(Ok(msg)) => {
+                let msg_type: String = Python::attach(|py| {
+                    msg.bind(py)
+                        .get_item("type")
+                        .ok()
+                        .and_then(|v| v.extract().ok())
+                        .unwrap_or_default()
+                });
                 match msg_type.as_str() {
                     "lifespan.startup.complete" => {
-                        let state: Option<Py<PyAny>> =
-                            msg.bind(py).get_item("state").ok().map(|v| v.unbind());
-                        mgr.state = crate::runtime::clone_opt_py(py, &state);
-                        Ok(mgr)
+                        let state: Option<Py<PyAny>> = Python::attach(|py| {
+                            msg.bind(py).get_item("state").ok().map(|v| v.unbind())
+                        });
+                        Ok(Self {
+                            locals: locals.clone(),
+                            to_app: Some(Python::attach(|py| to_app.clone_ref(py))),
+                            from_app: Some(Python::attach(|py| from_app.clone_ref(py))),
+                            state,
+                        })
                     }
                     "lifespan.startup.failed" => {
-                        let text: String = msg
-                            .bind(py)
-                            .get_item("message")
-                            .ok()
-                            .and_then(|v| v.extract().ok())
-                            .unwrap_or_else(|| "unknown".to_string());
+                        let text: String = Python::attach(|py| {
+                            msg.bind(py)
+                                .get_item("message")
+                                .ok()
+                                .and_then(|v| v.extract().ok())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        });
                         Err(LifespanError::Failed(text))
                     }
                     other => Err(LifespanError::Unsupported(format!(
@@ -186,162 +206,101 @@ impl LifespanManager {
                     ))),
                 }
             }
-            Err(msg) => {
-                let _ = app_future.bind(py).call_method1("cancel", ());
-                Err(LifespanError::Unsupported(msg))
+            Some(Err(e)) => {
+                Python::attach(|py| e.print(py));
+                Err(LifespanError::Unsupported(
+                    "lifespan reply failed".to_string(),
+                ))
             }
+            None => Err(LifespanError::Unsupported(
+                "app exited without a lifespan reply (or timed out)".to_string(),
+            )),
         }
     }
 
     /// Run shutdown handshake (best effort; logs but never raises).
-    pub fn shutdown(&self, py: Python<'_>, timeout_secs: f64) {
+    pub async fn shutdown(&self, timeout: std::time::Duration) {
         let (to_app, from_app) = match (&self.to_app, &self.from_app) {
-            (Some(t), Some(f)) => (t.clone_ref(py), f.clone_ref(py)),
-            _ => return, // startup never completed; nothing to shut down.
+            (Some(t), Some(f)) => (
+                Python::attach(|py| t.clone_ref(py)),
+                Python::attach(|py| f.clone_ref(py)),
+            ),
+            _ => return,
         };
-        if Self::queue_put(py, &self.loop_obj, &to_app, "lifespan.shutdown").is_err() {
+        if Self::queue_put(&self.locals, &to_app, "lifespan.shutdown")
+            .await
+            .is_err()
+        {
             return;
         }
-        match Self::queue_get(py, &self.loop_obj, &from_app, timeout_secs) {
-            Ok(msg) => {
-                let msg_type: String = msg
-                    .bind(py)
-                    .get_item("type")
-                    .ok()
-                    .and_then(|v| v.extract().ok())
-                    .unwrap_or_default();
-                if msg_type == "lifespan.shutdown.failed" {
-                    let text: String = msg
-                        .bind(py)
-                        .get_item("message")
+        let get_fut = Self::queue_get(&self.locals, &from_app);
+        tokio::pin!(get_fut);
+        let reply = tokio::select! {
+            biased;
+            r = &mut get_fut => Some(r),
+            _ = tokio::time::sleep(timeout) => None,
+        };
+        match reply {
+            Some(Ok(msg)) => {
+                let msg_type: String = Python::attach(|py| {
+                    msg.bind(py)
+                        .get_item("type")
                         .ok()
                         .and_then(|v| v.extract().ok())
-                        .unwrap_or_else(|| "unknown".to_string());
+                        .unwrap_or_default()
+                });
+                if msg_type == "lifespan.shutdown.failed" {
+                    let text: String = Python::attach(|py| {
+                        msg.bind(py)
+                            .get_item("message")
+                            .ok()
+                            .and_then(|v| v.extract().ok())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    });
                     eprintln!("ERROR rustwasgi: lifespan.shutdown.failed: {text}");
                 }
             }
-            Err(msg) => {
-                eprintln!("WARN rustwasgi: lifespan shutdown: {msg}");
+            Some(Err(e)) => {
+                Python::attach(|py| e.print(py));
+                eprintln!("WARN rustwasgi: lifespan shutdown reply failed");
             }
-        }
-        if let Some(fut) = &self._app_future {
-            let _ = fut.bind(py).call_method1("cancel", ());
+            None => {
+                eprintln!("WARN rustwasgi: lifespan shutdown timed out");
+            }
         }
     }
 
-    /// Submit `queue.put({"type": kind})` and wait (GIL released in wait).
-    fn queue_put(
-        py: Python<'_>,
-        loop_obj: &Py<PyAny>,
-        queue: &Py<PyAny>,
-        kind: &str,
-    ) -> Result<(), String> {
-        let loop_bound = loop_obj.bind(py);
-        let msg = PyDict::new(py);
-        msg.set_item("type", kind)
-            .map_err(|e| format!("dict: {e}"))?;
-        let put_coro = queue
-            .bind(py)
-            .call_method1("put", (msg,))
-            .map_err(|e| format!("queue.put: {e}"))?;
-        let fut = Bridge::submit(py, loop_bound, put_coro).map_err(|e| format!("submit: {e}"))?;
-        fut.bind(py)
-            .call_method1("result", (10.0,))
+    /// Deliver `{"type": kind}` asynchronously (GIL only for construction).
+    async fn queue_put(locals: &TaskLocals, queue: &Py<PyAny>, kind: &str) -> Result<(), String> {
+        let put_fut = Python::attach(|py| {
+            let msg = PyDict::new(py);
+            msg.set_item("type", kind)
+                .map_err(|e| format!("dict: {e}"))?;
+            let put_coro = queue
+                .bind(py)
+                .call_method1("put", (msg,))
+                .map_err(|e| format!("queue.put: {e}"))?;
+            into_future(locals, put_coro).map_err(|e| {
+                e.print(py);
+                "lifespan submit failed".to_string()
+            })
+        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), put_fut)
+            .await
+            .map_err(|_| "lifespan put timed out".to_string())?
             .map(|_| ())
             .map_err(|e| {
-                e.print(py);
-                "queue.put failed".to_string()
+                Python::attach(|py| e.print(py));
+                "lifespan put failed".to_string()
             })
     }
 
-    /// Wait for the startup reply: submit ONE `queue.get()` and poll it in
-    /// short slices so an already-dead app task (no lifespan support) is
-    /// detected in ~0.5s instead of after the full handshake timeout.
-    /// Submitting once (not once per slice) avoids stranding orphaned `get`
-    /// tasks on the loop; the future is cancelled on give-up.
-    fn wait_startup_reply(
-        py: Python<'_>,
-        loop_obj: &Py<PyAny>,
-        from_app: &Py<PyAny>,
-        app_future: &Py<PyAny>,
-    ) -> Result<Py<PyAny>, String> {
-        let loop_bound = loop_obj.bind(py);
-        let get_coro = from_app
-            .bind(py)
-            .call_method0("get")
-            .map_err(|e| format!("queue.get: {e}"))?;
-        let fut = Bridge::submit(py, loop_bound, get_coro).map_err(|e| format!("submit: {e}"))?;
-        let fut_ref = fut.bind(py);
-        let start = std::time::Instant::now();
-        loop {
-            match fut_ref.call_method1("result", (0.5,)) {
-                Ok(msg) => return Ok(msg.unbind()),
-                Err(e) if is_timeout_error(py, &e) => {
-                    let done: bool = app_future
-                        .bind(py)
-                        .call_method0("done")
-                        .and_then(|v| v.extract())
-                        .unwrap_or(false);
-                    if done {
-                        let _ = fut_ref.call_method0("cancel");
-                        return Err("app exited without a lifespan reply (unsupported)".to_string());
-                    }
-                    if start.elapsed().as_secs_f64() >= HANDSHAKE_TIMEOUT {
-                        let _ = fut_ref.call_method0("cancel");
-                        return Err(
-                            "lifespan reply timed out (app may not support lifespan)".to_string()
-                        );
-                    }
-                }
-                Err(e) => {
-                    let _ = fut_ref.call_method0("cancel");
-                    e.print(py);
-                    return Err("lifespan reply failed".to_string());
-                }
-            }
-        }
+    /// Await one `queue.get()` asynchronously (GIL only for construction).
+    async fn queue_get(locals: &TaskLocals, queue: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let get_fut = Python::attach(|py| {
+            let get_coro = queue.bind(py).call_method0("get")?;
+            into_future(locals, get_coro)
+        })?;
+        get_fut.await
     }
-
-    /// Submit `queue.get()` and wait up to `timeout` (GIL released in wait).
-    /// The future is cancelled on failure so no orphaned `get` task lingers
-    /// on the loop (a destroyed-pending task logs noise at loop close).
-    fn queue_get(
-        py: Python<'_>,
-        loop_obj: &Py<PyAny>,
-        queue: &Py<PyAny>,
-        timeout: f64,
-    ) -> Result<Py<PyAny>, String> {
-        let loop_bound = loop_obj.bind(py);
-        let get_coro = queue
-            .bind(py)
-            .call_method0("get")
-            .map_err(|e| format!("queue.get: {e}"))?;
-        let fut = Bridge::submit(py, loop_bound, get_coro).map_err(|e| format!("submit: {e}"))?;
-        let fut_ref = fut.bind(py);
-        match fut_ref.call_method1("result", (timeout,)) {
-            Ok(msg) => Ok(msg.unbind()),
-            Err(e) => {
-                let _ = fut_ref.call_method0("cancel");
-                // Timeouts just mean "no lifespan support"; don't dump traces.
-                if is_timeout_error(py, &e) {
-                    Err("lifespan reply timed out (app may not support lifespan)".to_string())
-                } else {
-                    e.print(py);
-                    Err("lifespan reply failed".to_string())
-                }
-            }
-        }
-    }
-}
-
-/// True for `concurrent.futures.TimeoutError` (and `asyncio.TimeoutError`,
-/// which is an alias in 3.11+).
-fn is_timeout_error(py: Python<'_>, e: &PyErr) -> bool {
-    e.get_type(py)
-        .name()
-        .map(|n| {
-            let n = n.to_string_lossy();
-            n.contains("Timeout")
-        })
-        .unwrap_or(false)
 }

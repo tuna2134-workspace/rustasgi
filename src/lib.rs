@@ -7,9 +7,21 @@
 //! - `run_worker(app, listeners, ...)` — Gunicorn worker path: receives the
 //!   already-loaded ASGI callable plus already-bound (dup'd) listener FDs.
 //!
-//! Both release the GIL while Tokio drives hyper; per-request Python work
-//! re-acquires the GIL on blocking-pool threads and executes coroutines on
-//! the dedicated asyncio loop thread (see `runtime.rs`).
+//! # Runtime ownership (one per worker process, post-fork only)
+//!
+//! ```text
+//! run()/run_worker()  (worker process, never the Gunicorn master)
+//!   1. import app / install bridge (GIL)
+//!   2. create asyncio loop object + TaskLocals; spawn its driver thread
+//!   3. build the Tokio multi-thread runtime; share it with
+//!      pyo3-async-runtimes via `init_with_runtime` (one runtime total)
+//!   4. lifespan.startup -> serve -> lifespan.shutdown (async, GIL-free waits)
+//!   5. cancel leftover tasks, stop loop, join thread, return
+//! ```
+//!
+//! Nothing Tokio/asyncio is created at import time or pre-fork, so
+//! `--preload` is safe: only the (user) application object may predate the
+//! fork; every runtime is born after it.
 
 mod asgi;
 mod cli;
@@ -22,6 +34,7 @@ mod ws;
 use std::time::Duration;
 
 use pyo3::prelude::*;
+use pyo3_async_runtimes::TaskLocals;
 
 use crate::cli::ServerConfig;
 use crate::lifespan::{LifespanError, LifespanManager, LifespanMode};
@@ -65,17 +78,19 @@ fn run(
     let notify: Py<PyAny> = py.eval(c"lambda: None", None, None)?.unbind();
     let is_alive: Py<PyAny> = py.eval(c"lambda: True", None, None)?.unbind();
 
-    let (app_obj, loop_obj, bridge) = setup_python(py, &app, &config)?;
+    let (app_obj, loop_handle, bridge) = setup_python(py, &app)?;
     config.log_info(&format!("loaded ASGI application {app}"));
     // Build the serving runtime first: standalone sockets must be bound on
     // the same runtime that serves them (Tokio I/O is runtime-bound).
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let rt_owned = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("rustwasgi-worker")
         .build()
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to start tokio runtime: {e}"))
         })?;
+    let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt_owned));
+    share_runtime(rt);
     let listeners = py
         .detach(|| rt.block_on(socket::bind_standalone(host, port)))
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
@@ -83,7 +98,7 @@ fn run(
         py,
         rt,
         app_obj,
-        loop_obj,
+        loop_handle,
         bridge,
         listeners,
         app,
@@ -93,7 +108,6 @@ fn run(
             is_alive,
             access: None,
         },
-        take_loop_handle(),
         0,
         30,
         3600,
@@ -143,30 +157,29 @@ fn run_worker(
         lifespan.to_string(),
         access_log,
     );
-    // Clone the app object out of the bound reference while holding the GIL.
     let app_obj = app.clone().unbind();
     let bridge = asgi::Bridge::install(py)?;
-    let (loop_obj, handle) = runtime::start_asyncio_loop(py)?;
-    // Build the serving runtime in this (post-fork) worker, then convert the
-    // inherited FDs into Tokio listeners *inside* its context (Tokio I/O is
-    // runtime-bound).
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let loop_handle = runtime::start_asyncio_loop(py)?;
+    // Serving runtime for this (post-fork) worker; inherited FDs become
+    // Tokio listeners *inside* its context (Tokio I/O is runtime-bound).
+    let rt_owned = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("rustwasgi-worker")
         .build()
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to start tokio runtime: {e}"))
         })?;
+    let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt_owned));
+    share_runtime(rt);
     let bound = {
         let _guard = rt.enter();
         socket::bind_inherited(inherited).map_err(pyo3::exceptions::PyRuntimeError::new_err)?
     };
-    // The loop thread is joined at the end of serve_process_on.
     serve_process_on(
         py,
         rt,
         app_obj,
-        loop_obj,
+        loop_handle,
         bridge,
         bound,
         app_spec.to_string(),
@@ -176,7 +189,6 @@ fn run_worker(
             is_alive,
             access,
         },
-        Some(handle),
         max_requests,
         graceful_timeout,
         heartbeat_interval,
@@ -185,80 +197,48 @@ fn run_worker(
     Ok(())
 }
 
+/// Share our runtime with pyo3-async-runtimes so `future_into_py` send-waits
+/// spawn onto it instead of a second runtime. Once per process (post-fork);
+/// later calls are harmless no-ops.
+fn share_runtime(rt: &'static tokio::runtime::Runtime) {
+    let _ = pyo3_async_runtimes::tokio::init_with_runtime(rt);
+}
+
 /// Import app + install bridge + start loop (standalone path).
 fn setup_python(
     py: Python<'_>,
     app_spec: &str,
-    _config: &ServerConfig,
-) -> PyResult<(Py<PyAny>, Py<PyAny>, asgi::Bridge)> {
+) -> PyResult<(Py<PyAny>, runtime::LoopHandle, asgi::Bridge)> {
     let app_obj = runtime::import_app(py, app_spec)?;
     let bridge = asgi::Bridge::install(py)?;
-    let (loop_obj, handle) = runtime::start_asyncio_loop(py)?;
-    // Stash the handle where serve_process can join it: leak a box into a
-    // module-global. (Only one server per process in standalone mode.)
-    store_loop_handle(handle);
-    Ok((app_obj, loop_obj, bridge))
+    let loop_handle = runtime::start_asyncio_loop(py)?;
+    Ok((app_obj, loop_handle, bridge))
 }
 
-static LOOP_HANDLE: std::sync::OnceLock<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
-    std::sync::OnceLock::new();
-
-fn store_loop_handle(handle: std::thread::JoinHandle<()>) {
-    let cell = LOOP_HANDLE.get_or_init(|| std::sync::Mutex::new(None));
-    *cell.lock().expect("loop handle lock") = Some(handle);
-}
-
-fn take_loop_handle() -> Option<std::thread::JoinHandle<()>> {
-    LOOP_HANDLE
-        .get()
-        .and_then(|cell| cell.lock().expect("loop handle lock").take())
-}
-
-/// Shared orchestration on an already-built runtime: lifespan startup ->
-/// serve -> lifespan shutdown -> loop stop/join.
+/// Shared orchestration on the worker runtime: lifespan startup -> serve ->
+/// lifespan shutdown -> task cleanup -> loop stop/join. All waits are async
+/// with the GIL released; no thread is ever blocked on Python.
 #[allow(clippy::too_many_arguments)]
 fn serve_process_on(
     py: Python<'_>,
-    rt: tokio::runtime::Runtime,
+    rt: &'static tokio::runtime::Runtime,
     app_obj: Py<PyAny>,
-    loop_obj: Py<PyAny>,
+    loop_handle: runtime::LoopHandle,
     bridge: asgi::Bridge,
     listeners: Vec<BoundListener>,
     app_spec: String,
     config: &ServerConfig,
     hooks: WorkerHooks,
-    loop_handle: Option<std::thread::JoinHandle<()>>,
     max_requests: usize,
     graceful_timeout: u64,
     heartbeat_interval: u64,
     keep_alive: u64,
 ) -> PyResult<()> {
-    // --- lifespan startup (before accepting) ------------------------------
-    let mode = LifespanMode::parse(&config.lifespan);
-    let lifespan_state: Option<Py<PyAny>> = match mode {
-        LifespanMode::Off => None,
-        LifespanMode::Auto | LifespanMode::On => {
-            match LifespanManager::startup(py, &bridge, &loop_obj, &app_obj) {
-                Ok(mgr) => {
-                    eprintln!("INFO rustwasgi: lifespan startup complete");
-                    let state = crate::runtime::clone_opt_py(py, &mgr.state);
-                    store_lifespan_manager(mgr);
-                    state
-                }
-                Err(LifespanError::Unsupported(msg)) if mode == LifespanMode::Auto => {
-                    eprintln!("INFO rustwasgi: lifespan unsupported, continuing ({msg})");
-                    None
-                }
-                Err(e) => {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "lifespan startup failed: {e}"
-                    )));
-                }
-            }
-        }
-    };
-
-    // --- serve (GIL released) ----------------------------------------------
+    let runtime::LoopHandle {
+        loop_obj,
+        locals,
+        join_handle,
+    } = loop_handle;
     let serve_config = ServeConfig {
         app_spec,
         root_path: config.root_path.clone(),
@@ -268,44 +248,109 @@ fn serve_process_on(
         access_log: config.access_log,
         keep_alive_secs: keep_alive,
     };
-    // Keep one loop reference for the post-serve stop; the other moves into
-    // the serving closure.
+    // Keep one loop reference for the post-serve stop.
     let loop_for_stop = loop_obj.clone_ref(py);
-    py.detach(move || {
-        let res = rt.block_on(server::serve(
-            listeners,
-            app_obj,
-            loop_obj,
-            bridge,
-            lifespan_state,
-            serve_config,
-            hooks,
-        ));
-        // Bounded teardown: lingering keep-alive/idle tasks must not stall
-        // worker exit (Gunicorn enforces graceful-timeout externally too).
-        rt.shutdown_timeout(Duration::from_secs(5));
-        res.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("server error: {e}")))
+
+    py.detach(|| {
+        rt.block_on(async {
+            // --- lifespan startup (before accepting) ----------------------
+            let mode = LifespanMode::parse(&config.lifespan);
+            let lifespan_state = match mode {
+                LifespanMode::Off => None,
+                LifespanMode::Auto | LifespanMode::On => {
+                    match LifespanManager::startup(&bridge, &locals, &app_obj).await {
+                        Ok(mgr) => {
+                            eprintln!("INFO rustwasgi: lifespan startup complete");
+                            let state =
+                                Python::attach(|py| crate::runtime::clone_opt_py(py, &mgr.state));
+                            store_lifespan_manager(mgr);
+                            state
+                        }
+                        Err(LifespanError::Unsupported(msg)) if mode == LifespanMode::Auto => {
+                            eprintln!("INFO rustwasgi: lifespan unsupported, continuing ({msg})");
+                            None
+                        }
+                        Err(e) => {
+                            return Err(format!("lifespan startup failed: {e}"));
+                        }
+                    }
+                }
+            };
+
+            // --- serve ----------------------------------------------------
+            server::serve(
+                listeners,
+                app_obj,
+                bridge,
+                locals.clone(),
+                lifespan_state,
+                serve_config,
+                hooks,
+            )
+            .await?;
+
+            // --- lifespan shutdown ----------------------------------------
+            if let Some(mgr) = take_lifespan_manager() {
+                mgr.shutdown(std::time::Duration::from_secs(10)).await;
+                eprintln!("INFO rustwasgi: lifespan shutdown complete");
+            }
+
+            // --- cancel leftover loop tasks (forced-abort hygiene) --------
+            cancel_pending_tasks(&locals).await;
+            Ok::<(), String>(())
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     })?;
 
-    // --- lifespan shutdown ---------------------------------------------------
-    if let Some(mgr) = take_lifespan_manager() {
-        mgr.shutdown(py, 10.0);
-        eprintln!("INFO rustwasgi: lifespan shutdown complete");
-    }
-
-    // --- stop + join the loop thread -------------------------------------------
+    // --- stop + join the loop thread ---------------------------------------
     // Schedule stop with the GIL, then join WITHOUT it: the loop thread
     // needs the GIL to run the stop callback (joining while holding the
     // GIL deadlocks).
     runtime::stop_asyncio_loop(&loop_for_stop);
-    if let Some(handle) = loop_handle {
-        // run_forever() returns after loop.stop(); the GIL is released
-        // while joining so shutdown always makes progress.
+    if let Some(handle) = join_handle {
         py.detach(move || {
             let _ = handle.join();
         });
     }
     Ok(())
+}
+
+/// Cancel all pending tasks on the loop so shutdown never logs
+/// "Task was destroyed but it is pending". Best effort, bounded.
+async fn cancel_pending_tasks(locals: &TaskLocals) {
+    let res: Result<(), String> = async {
+        let coro = Python::attach(|py| {
+            let asyncio = py.import("asyncio").map_err(|e| format!("{e}"))?;
+            // all_tasks() must run ON the loop: wrap in a coroutine.
+            let code = c"async def _cancel_all():\n    import asyncio\n    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]\n    for t in tasks:\n        t.cancel()\n    if tasks:\n        await asyncio.gather(*tasks, return_exceptions=True)\n    return len(tasks)\n";
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                code,
+                c"rustwasgi_cleanup.py",
+                c"rustwasgi_cleanup",
+            )
+            .map_err(|e| format!("{e}"))?;
+            let coro = module
+                .getattr("_cancel_all")
+                .map_err(|e| format!("{e}"))?
+                .call0()
+                .map_err(|e| format!("{e}"))?;
+            let _ = asyncio;
+            crate::asgi::into_future(locals, coro).map_err(|e| format!("{e}"))
+        })?;
+        tokio::time::timeout(Duration::from_secs(5), coro)
+            .await
+            .map_err(|_| "cleanup timed out".to_string())?
+            .map(|_| ())
+            .map_err(|e| {
+                Python::attach(|py| e.print(py));
+                "cleanup failed".to_string()
+            })
+    }
+    .await;
+    if let Err(e) = res {
+        eprintln!("WARN rustwasgi: loop cleanup: {e}");
+    }
 }
 
 static LIFESPAN_MANAGER: std::sync::OnceLock<std::sync::Mutex<Option<LifespanManager>>> =
@@ -322,12 +367,108 @@ fn take_lifespan_manager() -> Option<LifespanManager> {
         .and_then(|cell| cell.lock().expect("lifespan lock").take())
 }
 
+/// Diagnostic microbenchmark for §27: measures the raw `into_future`
+/// round-trip (submit a no-op coroutine, await completion) at several
+/// concurrency levels. Headless: builds its own loop thread + runtime, so it
+/// never touches worker globals.
+///
+/// Returns `(idle_ms, per_level_json)` where levels cover 4..=64.
+#[pyfunction]
+fn _bench_bridge(py: Python<'_>, concurrency: usize, iters: usize) -> PyResult<String> {
+    use std::time::Instant;
+
+    // Headless loop thread (same construction as workers, no server).
+    let asyncio = py.import("asyncio")?;
+    let loop_obj: Py<PyAny> = asyncio.call_method0("new_event_loop")?.unbind();
+    let locals = TaskLocals::new(loop_obj.bind(py).clone());
+    let thread_loop = loop_obj.clone_ref(py);
+    let handle = std::thread::Builder::new()
+        .name("rustwasgi-bench-loop".to_string())
+        .spawn(move || {
+            Python::attach(|py| {
+                let _ = py
+                    .import("asyncio")
+                    .and_then(|m| m.call_method1("set_event_loop", (thread_loop.bind(py),)))
+                    .and_then(|_| thread_loop.bind(py).call_method0("run_forever"));
+            });
+        })
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("bench loop thread: {e}"))
+        })?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("bench runtime: {e}")))?;
+
+    // A no-op coroutine factory, compiled once.
+    let noop_fn: Py<PyAny> = Python::attach(|py| {
+        let code = c"async def _noop():\n    return None\n";
+        let module =
+            pyo3::types::PyModule::from_code(py, code, c"rustwasgi_bench.py", c"rustwasgi_bench")?;
+        Ok::<Py<PyAny>, PyErr>(module.getattr("_noop")?.unbind())
+    })?;
+    let levels = [1usize, 4, 8, 16, 20, 32, 64];
+    let mut out = String::from("{");
+    // block_on WITHOUT the GIL: the loop thread needs it to run the probes.
+    py.detach(|| {
+        rt.block_on(async {
+            for (li, level) in levels.iter().enumerate() {
+                let level = (*level).min(concurrency.max(1));
+                let per_task = (iters / level).max(1);
+                let start = Instant::now();
+                let mut tasks = Vec::with_capacity(level);
+                for _ in 0..level {
+                    let locals_c = locals.clone();
+                    let noop_c = Python::attach(|py| noop_fn.clone_ref(py));
+                    tasks.push(tokio::spawn(async move {
+                        for _ in 0..per_task {
+                            let fut = Python::attach(|py| {
+                                let coro = noop_c.bind(py).call0()?;
+                                crate::asgi::into_future(&locals_c, coro)
+                            });
+                            let fut = match fut {
+                                Ok(f) => f,
+                                Err(_) => break,
+                            };
+                            if fut.await.is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                }
+                for t in tasks {
+                    let _ = t.await;
+                }
+                let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let total_ops = (per_task * level) as f64;
+                if li > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("\"{level}\": {:.3}", total_ms / total_ops));
+                if level >= concurrency {
+                    break;
+                }
+            }
+        })
+    });
+    out.push('}');
+
+    // Stop + join (GIL released for join).
+    runtime::stop_asyncio_loop(&loop_obj);
+    py.detach(move || {
+        let _ = handle.join();
+    });
+    Ok(out)
+}
+
 /// Native module. The maturin `module-name` maps this to
 /// `rustwasgi._rustwasgi`; the pure-Python `rustwasgi/__init__.py` re-exports.
 #[pymodule]
 fn _rustwasgi(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(run_worker, m)?)?;
+    m.add_function(wrap_pyfunction!(_bench_bridge, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

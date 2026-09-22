@@ -1,45 +1,36 @@
-//! ASGI <-> hyper adapter.
+//! ASGI <-> hyper adapter with no thread hops on the request path.
 //!
-//! Responsibilities:
-//! - build the ASGI `scope` dict from a hyper request (+ socket addrs),
-//! - provide per-request `receive` / `send` callables backed by async
-//!   channels (never buffered end-to-end),
-//! - invoke `await app(scope, receive, send)` on the dedicated asyncio loop
-//!   thread and translate the captured response start into a hyper response.
+//! # Integration model (`pyo3-async-runtimes`, Tokio backend)
 //!
-//! # Streaming design
+//! - Python awaitable -> Rust future: `into_future_with_locals(&locals, coro)`
+//!   schedules the coroutine onto our explicit asyncio loop (fire-and-forget
+//!   signal) and returns a future completed through a `oneshot` channel. The
+//!   awaiting Tokio task parks — no OS thread is blocked, no condition
+//!   variable exists, the GIL is not held while waiting.
+//! - Rust future -> Python awaitable: `tokio::future_into_py_with_locals`
+//!   (backpressured `send()` waits only). Spawned onto the worker's own Tokio
+//!   runtime via `init_with_runtime` — no second runtime exists.
+//! - `receive()` is a plain Python coroutine awaiting an `asyncio.Queue`
+//!   (bodyless requests get a pre-seeded terminal message, no queue traffic).
+//! - `send()` is a plain Python coroutine: `SendSink._push` does a non-blocking
+//!   `try_send`; only a FULL channel returns an awaitable (genuine bounded
+//!   backpressure, GIL-free wait).
+//!
+//! Per `GET /` request: scope build (GIL, µs) + 2 loop wakeups (init, app) +
+//! completion wakeup. No `spawn_blocking`, no `Future.result`, no threads.
 //!
 //! ```text
-//! hyper body stream (Tokio task)
-//!        |  per chunk, via loop.call_soon_threadsafe(queue.put_nowait, msg)
-//!        v
-//! asyncio.Queue  (unbounded; see known limitations)
-//!        |  await queue.get()
-//!        v
-//! Python `await receive()`  -> {"type": "http.request", ...}
-//!
-//! Python `await send(msg)`
-//!        |  SendSink._push (releases GIL while waiting for capacity)
-//!        v
-//! tokio::sync::mpsc (BOUND = RESPONSE_CHANNEL_BOUND, real backpressure)
-//!        |  rx.recv().await
-//!        v
-//! hyper response Body channel -> TCP socket
+//! hyper body chunks --Tokio feeder--> into_future(queue.put) --> asyncio.Queue
+//!                                                                          | await
+//!                                                              Python await receive()
+//! Python await send(msg) --try_send--> tokio mpsc (bound 16)
+//!       \--on Full--> future_into_py(send) --> capacity (GIL-free)
+//!                                                  | rx.recv().await
+//! hyper Channel body <--pump task--------------+--> TCP socket
 //! ```
-//!
-//! `receive()` is a real async operation on an `asyncio.Queue` fed
-//! incrementally: the application coroutine is submitted *before* the request
-//! body has arrived, so large uploads stream through `http.request` messages
-//! with `more_body=True/False`. hyper decodes `Transfer-Encoding: chunked`
-//! itself, so the app only ever sees plain body bytes.
-//!
-//! `send()` forwards each message into a **bounded** Tokio mpsc channel
-//! ([`RESPONSE_CHANNEL_BOUND`]). When the client is slow and the channel is
-//! full, the loop thread parks (GIL released) until capacity frees up —
-//! genuine backpressure instead of unbounded buffering. Response bodies are
-//! forwarded chunk-by-chunk into hyper's streaming body; nothing is
-//! concatenated in memory.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -47,24 +38,31 @@ use std::sync::{
 
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBool, PyByteArray, PyBytes, PyDict, PyList, PySequence, PyTuple};
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PySequence, PyTuple};
+use pyo3_async_runtimes::{TaskLocals, tokio as par_tokio};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 /// Bound of the application -> server response channel.
 ///
-/// This is the documented backpressure buffer: at most this many response
-/// messages may be in flight between the Python app and the hyper response
-/// pump. When full, `send()` waits (GIL released) for the network task to
-/// catch up.
+/// Genuine backpressure buffer: when full, `send()` asynchronously waits for
+/// the pump task (GIL released). No unbounded buffering anywhere.
 pub const RESPONSE_CHANNEL_BOUND: usize = 16;
 
 /// Bound of the server -> application request queue (`asyncio.Queue(maxsize)`).
 ///
-/// The feeder uses a blocking `queue.put` (via `run_coroutine_threadsafe`),
-/// so a slow application stalls the feeder, which stalls hyper, which applies
-/// TCP backpressure to the client. Worst-case memory per request is roughly
+/// The Tokio feeder awaits `queue.put` through `into_future` (no threads), so
+/// a slow application stalls the feeder, which stalls hyper, which applies
+/// TCP backpressure. Worst-case memory per request is roughly
 /// `MAXSIZE x max-chunk-size`.
 pub const REQUEST_QUEUE_MAXSIZE: usize = 64;
+
+/// Per-put timeout for request-body queue puts (fail-safe, not a hot path).
+pub const REQUEST_PUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Awaitable Rust future resolving to the Python app's return (usually None)
+/// or its exception (traceback preserved in `PyErr`).
+pub type AppFuture = Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>;
 
 /// Events flowing from the Python application to the hyper response pump.
 #[derive(Debug)]
@@ -81,49 +79,77 @@ pub enum ResponseEvent {
 
 /// Rust end of `send()`, exposed to Python.
 ///
-/// Created per request in Rust, wrapped by the Python `_Sender` class.
-/// `_push` is called on the asyncio loop thread (never inside a Tokio runtime
-/// worker), so `blocking_send` is safe; the GIL is released while waiting for
-/// channel capacity so one slow client cannot stall other requests' Python
-/// execution.
+/// Created per request; wrapped by the Python `_Sender` class. `_push` never
+/// blocks: it validates, `try_send`s, and only on a FULL channel builds a
+/// `future_into_py` awaitable whose GIL-free wait provides backpressure.
+/// Closed channel / lost connection -> `OSError` (ASGI 2.4+ send-after-
+/// disconnect semantics).
 #[pyclass]
 pub struct SendSink {
     tx: mpsc::Sender<ResponseEvent>,
     disconnected: Arc<AtomicBool>,
+    locals: TaskLocals,
 }
 
 #[pymethods]
 impl SendSink {
-    fn _push(&self, py: Python<'_>, message: Bound<'_, PyAny>) -> PyResult<()> {
+    /// Returns `None` when the message was accepted immediately, or a Python
+    /// awaitable to wait on when the channel is full.
+    fn _push<'py>(
+        &self,
+        py: Python<'py>,
+        message: Bound<'py, PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
         if self.disconnected.load(Ordering::SeqCst) {
             return Err(PyOSError::new_err(
                 "ASGI send(): connection closed (send after disconnect)",
             ));
         }
         let event = parse_send_message(&message)?;
-        // Release the GIL while applying backpressure.
-        py.detach(|| self.tx.blocking_send(event))
-            .map_err(|_| PyOSError::new_err("ASGI send(): connection closed"))?;
-        Ok(())
+        match self.tx.try_send(event) {
+            Ok(()) => Ok(None),
+            Err(TrySendError::Full(event)) => {
+                let tx = self.tx.clone();
+                let fut = async move {
+                    tx.send(event)
+                        .await
+                        .map_err(|_| PyOSError::new_err("ASGI send(): connection closed"))?;
+                    Ok(())
+                };
+                Ok(Some(par_tokio::future_into_py_with_locals(
+                    py,
+                    self.locals.clone(),
+                    fut,
+                )?))
+            }
+            Err(TrySendError::Closed(_)) => {
+                Err(PyOSError::new_err("ASGI send(): connection closed"))
+            }
+        }
     }
 }
 
 impl SendSink {
-    pub fn new(tx: mpsc::Sender<ResponseEvent>, disconnected: Arc<AtomicBool>) -> Self {
-        Self { tx, disconnected }
+    pub fn new(
+        tx: mpsc::Sender<ResponseEvent>,
+        disconnected: Arc<AtomicBool>,
+        locals: TaskLocals,
+    ) -> Self {
+        Self {
+            tx,
+            disconnected,
+            locals,
+        }
     }
 }
 
 /// Validate one `send()` message per the ASGI HTTP spec.
 ///
-/// - unknown `type` -> error; missing keys with defaults are tolerated, but
-///   missing/invalid `status` or non-bytes headers are rejected;
-/// - header names must be lowercase bytes, must not be pseudo-headers;
-/// - an app-supplied `transfer-encoding` header is stripped: the server owns
-///   HTTP framing (ASGI spec);
-/// - `trailers: True` / `http.response.trailers` are rejected with a clear
-///   error (documented limitation: hyper's server API has no stable trailer
-///   support for HTTP/1.1 responses);
+/// - unknown `type` -> error; missing/invalid `status` or non-bytes headers
+///   are rejected; header names must be lowercase bytes, no pseudo-headers;
+/// - an app-supplied `transfer-encoding` header is stripped (server owns
+///   framing); `trailers: True` / `http.response.trailers` are rejected with
+///   a clear error (hyper has no stable HTTP/1 trailer support);
 /// - extra unknown keys are ignored (ASGI error-handling rules).
 fn parse_send_message(message: &Bound<'_, PyAny>) -> PyResult<ResponseEvent> {
     let msg_type: String = message
@@ -225,7 +251,6 @@ fn as_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         return Ok(b.as_bytes().to_vec());
     }
     if let Ok(b) = obj.cast::<PyByteArray>() {
-        // SAFETY: copy under the GIL; no Python code runs during the copy.
         return Ok(unsafe { b.as_bytes().to_vec() });
     }
     if obj.is_none() {
@@ -234,21 +259,30 @@ fn as_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     Err(PyValueError::new_err("expected bytes"))
 }
 
-/// Python source for the per-request channel objects plus the ASGI 2/3
-/// compatibility wrapper. `receive` awaits an `asyncio.Queue` fed by Rust;
-/// `send` forwards into the Rust channel via `SendSink`.
+/// Python channel objects plus the ASGI 2/3 compatibility wrapper.
+///
+/// `receive` awaits an `asyncio.Queue` (or a pre-seeded terminal message for
+/// bodyless requests — no queue traffic at all); `send` forwards into the
+/// Rust channel via `SendSink` (awaiting only under real backpressure).
 const BRIDGE_CODE: &str = r#"
 import asyncio
 import inspect
 
+_TERMINAL = {"type": "http.request", "body": b"", "more_body": False}
+_STREAMING = object()
+
 
 class _Receive:
-    """await receive() -> next fed http.request / http.disconnect message."""
+    """await receive() -> next http.request / http.disconnect message."""
 
-    def __init__(self, queue):
+    def __init__(self, queue, first=_STREAMING):
         self._queue = queue
+        self._first = first
 
     async def __call__(self):
+        if self._first is not _STREAMING:
+            message, self._first = self._first, _STREAMING
+            return message
         return await self._queue.get()
 
 
@@ -259,12 +293,15 @@ class _Sender:
         self._sink = sink
 
     async def __call__(self, message):
-        self._sink._push(message)
+        pending = self._sink._push(message)
+        if pending is not None:
+            await pending
 
 
-async def _init_http_channel(receive_cls, send_cls, sink, maxsize):
+async def _init_http_channel(receive_cls, send_cls, sink, maxsize, terminal):
     queue = asyncio.Queue(maxsize=maxsize)
-    return queue, receive_cls(queue), send_cls(sink)
+    first = _TERMINAL if terminal else _STREAMING
+    return queue, receive_cls(queue, first), send_cls(sink)
 
 
 async def _init_lifespan_channel():
@@ -280,9 +317,13 @@ async def _init_lifespan_channel():
     return to_app, from_app, receive, send
 
 
-async def _init_ws_channel(send_cls, sink):
-    to_app = asyncio.Queue()
+async def _init_ws_channel(send_cls, sink, maxsize):
+    to_app = asyncio.Queue(maxsize=maxsize)
     return to_app, _Receive(to_app), send_cls(sink)
+
+
+async def _put_nowait(queue, message):
+    queue.put_nowait(message)
 
 
 async def _call_app(app, scope, receive, send):
@@ -320,7 +361,13 @@ pub struct Bridge {
     init_http_fn: Py<PyAny>,
     init_lifespan_fn: Py<PyAny>,
     init_ws_fn: Py<PyAny>,
+    put_nowait_fn: Py<PyAny>,
     call_app_fn: Py<PyAny>,
+    terminal_msg: Py<PyAny>,
+    streaming_sentinel: Py<PyAny>,
+    /// `asyncio.Queue()` constructor is loop-free since Python 3.10, allowing
+    /// single-submit channel setup. Older interpreters use the init coroutine.
+    pub direct_queue: bool,
 }
 
 impl Clone for Bridge {
@@ -331,7 +378,11 @@ impl Clone for Bridge {
             init_http_fn: self.init_http_fn.clone_ref(py),
             init_lifespan_fn: self.init_lifespan_fn.clone_ref(py),
             init_ws_fn: self.init_ws_fn.clone_ref(py),
+            put_nowait_fn: self.put_nowait_fn.clone_ref(py),
             call_app_fn: self.call_app_fn.clone_ref(py),
+            terminal_msg: self.terminal_msg.clone_ref(py),
+            streaming_sentinel: self.streaming_sentinel.clone_ref(py),
+            direct_queue: self.direct_queue,
         })
     }
 }
@@ -341,13 +392,25 @@ impl Bridge {
     pub fn install(py: Python<'_>) -> PyResult<Self> {
         let code = std::ffi::CString::new(BRIDGE_CODE).expect("bridge code");
         let module = PyModule::from_code(py, &code, c"rustwasgi_bridge.py", c"rustwasgi_bridge")?;
+        let sys = py.import("sys")?;
+        let version: (u8, u8) = (|| {
+            let info = sys.getattr("version_info")?;
+            let major: u8 = info.get_item(0)?.extract()?;
+            let minor: u8 = info.get_item(1)?.extract()?;
+            PyResult::Ok((major, minor))
+        })()
+        .unwrap_or((3, 8));
         Ok(Self {
             recv_cls: module.getattr("_Receive")?.unbind(),
             send_cls: module.getattr("_Sender")?.unbind(),
             init_http_fn: module.getattr("_init_http_channel")?.unbind(),
             init_lifespan_fn: module.getattr("_init_lifespan_channel")?.unbind(),
             init_ws_fn: module.getattr("_init_ws_channel")?.unbind(),
+            put_nowait_fn: module.getattr("_put_nowait")?.unbind(),
             call_app_fn: module.getattr("_call_app")?.unbind(),
+            terminal_msg: module.getattr("_TERMINAL")?.unbind(),
+            streaming_sentinel: module.getattr("_STREAMING")?.unbind(),
+            direct_queue: version >= (3, 10),
         })
     }
 
@@ -359,6 +422,10 @@ impl Bridge {
         self.init_ws_fn.bind(py).clone()
     }
 
+    pub fn put_nowait_fn<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        self.put_nowait_fn.bind(py).clone()
+    }
+
     /// The generic `_Sender` wrapper also fronts WebSocket sinks: it only
     /// calls `sink._push(message)`, and parsing is sink-specific.
     pub fn ws_send_cls<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
@@ -368,23 +435,19 @@ impl Bridge {
     pub fn call_app_fn<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
         self.call_app_fn.bind(py).clone()
     }
-
-    /// Submit `coro` to the loop from any thread; returns the
-    /// `concurrent.futures.Future`. Caller must hold the GIL only for the
-    /// submit itself.
-    pub fn submit(
-        py: Python<'_>,
-        loop_obj: &Bound<'_, PyAny>,
-        coro: Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
-        let asyncio = py.import("asyncio")?;
-        let future = asyncio.call_method1("run_coroutine_threadsafe", (coro, loop_obj))?;
-        Ok(future.unbind())
-    }
 }
 
-/// Flat HTTP request metadata extracted from hyper (cheap to move into
-/// `spawn_blocking`). The body itself streams separately.
+/// Convert a Python awaitable into an awaitable Rust future bound to our
+/// loop. The GIL is needed only to build/schedule; the returned future
+/// parks the Tokio task (oneshot/waker) with no threads and no GIL.
+pub fn into_future(locals: &TaskLocals, awaitable: Bound<'_, PyAny>) -> PyResult<AppFuture> {
+    let fut = pyo3_async_runtimes::into_future_with_locals(locals, awaitable)?;
+    Ok(Box::pin(fut))
+}
+
+/// Flat HTTP request metadata extracted from hyper (cheap to move).
+/// The body itself streams separately; `has_body == false` selects the
+/// zero-hop terminal fast path (no feeder task at all).
 #[derive(Debug, Clone)]
 pub struct RequestData {
     pub method: String,
@@ -395,65 +458,107 @@ pub struct RequestData {
     pub query_string: Vec<u8>,
     pub root_path: String,
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub has_body: bool,
     pub client_host: String,
     pub client_port: u16,
     pub server_host: String,
     pub server_port: u16,
 }
 
-/// Handles for one in-flight request after channel setup on the loop thread:
-/// - `app_future`: `concurrent.futures.Future` for the running application;
-/// - `queue`: the `asyncio.Queue` the feeder pushes `http.request` messages to.
+/// Handles for one in-flight request: the queue the feeder fills and the
+/// application future the request task awaits directly (no monitor thread —
+/// `Err` carries the traceback in `PyErr`).
 pub struct EstablishedCall {
-    pub app_future: Py<PyAny>,
     pub queue: Py<PyAny>,
+    pub app_fut: AppFuture,
 }
 
 /// Build scope, create the queue-backed channel, and submit the application.
-/// Blocks the calling (blocking-pool) thread while waiting for the tiny init
-/// coroutine; the GIL is released during those waits.
-pub fn establish_http_call(
+/// Fully async: GIL is held only for microsecond-scale construction steps;
+/// every wait is a waker-parked `into_future` await. No threads involved.
+pub async fn establish_http_call(
     bridge: &Bridge,
-    loop_obj: &Py<PyAny>,
+    locals: &TaskLocals,
     app: &Py<PyAny>,
     lifespan_state: Option<&Py<PyAny>>,
     req: &RequestData,
     sink: Py<SendSink>,
 ) -> Result<EstablishedCall, String> {
-    Python::attach(|py| {
-        establish_inner(py, bridge, loop_obj, app, lifespan_state, req, sink).map_err(|e| {
-            e.print(py);
-            format!("ASGI setup failed: {e}")
+    // 1. Channel: direct queue construction on 3.10+ (single submit for
+    // the whole request), init coroutine below that (two submits).
+    // Bodyless requests pre-seed the terminal message: no feeder, no queue
+    // traffic at all.
+    let (queue, receive, send): (Py<PyAny>, Py<PyAny>, Py<PyAny>) = if bridge.direct_queue {
+        Python::attach(|py| {
+            let asyncio = py.import("asyncio")?;
+            let queue = asyncio.call_method1("Queue", (REQUEST_QUEUE_MAXSIZE,))?;
+            let first = if req.has_body {
+                bridge.streaming_sentinel.bind(py).clone()
+            } else {
+                bridge.terminal_msg.bind(py).clone()
+            };
+            let receive = bridge.recv_cls.bind(py).call1((queue.clone(), first))?;
+            let send = bridge.send_cls.bind(py).call1((sink,))?;
+            Ok::<_, PyErr>((queue.unbind(), receive.unbind(), send.unbind()))
         })
+        .map_err(|e| {
+            Python::attach(|py| e.print(py));
+            "ASGI channel init failed".to_string()
+        })?
+    } else {
+        let init_fut = Python::attach(|py| {
+            let init_coro = bridge.init_http_fn.bind(py).call1((
+                bridge.recv_cls.bind(py),
+                bridge.send_cls.bind(py),
+                sink,
+                REQUEST_QUEUE_MAXSIZE,
+                !req.has_body, // `terminal`
+            ))?;
+            into_future(locals, init_coro)
+        })
+        .map_err(|e| {
+            Python::attach(|py| e.print(py));
+            "ASGI channel init failed".to_string()
+        })?;
+        let channel = init_fut.await.map_err(|e| {
+            Python::attach(|py| e.print(py));
+            "ASGI channel init failed".to_string()
+        })?;
+        Python::attach(|py| {
+            channel
+                .bind(py)
+                .extract::<(Py<PyAny>, Py<PyAny>, Py<PyAny>)>()
+                .map_err(|e| {
+                    e.print(py);
+                    "ASGI channel init failed".to_string()
+                })
+        })?
+    };
+
+    // 2. Build the ASGI HTTP scope (spec_version 2.5), constructed once.
+    // 3. Submit the application (ASGI 2/3 compatible wrapper).
+    let app_fut: AppFuture = Python::attach(|py| {
+        let scope = build_http_scope(py, lifespan_state, req)?;
+        let app_coro =
+            bridge
+                .call_app_fn(py)
+                .call1((app.bind(py), scope, receive.bind(py), send.bind(py)))?;
+        into_future(locals, app_coro)
     })
+    .map_err(|e| {
+        Python::attach(|py| e.print(py));
+        "ASGI submit failed".to_string()
+    })?;
+    Ok(EstablishedCall { queue, app_fut })
 }
 
-fn establish_inner(
-    py: Python<'_>,
-    bridge: &Bridge,
-    loop_obj: &Py<PyAny>,
-    app: &Py<PyAny>,
+fn build_http_scope<'py>(
+    py: Python<'py>,
     lifespan_state: Option<&Py<PyAny>>,
     req: &RequestData,
-    sink: Py<SendSink>,
-) -> PyResult<EstablishedCall> {
-    let loop_bound = loop_obj.bind(py);
+) -> PyResult<Bound<'py, PyDict>> {
+    use pyo3::types::IntoPyDict;
 
-    // 1. Create the queue + receive/send pair on the loop thread.
-    let init_coro = bridge.init_http_fn.bind(py).call1((
-        bridge.recv_cls.bind(py),
-        bridge.send_cls.bind(py),
-        sink,
-        REQUEST_QUEUE_MAXSIZE,
-    ))?;
-    // `submit` borrows py; drop the future's GIL need during the wait by
-    // scoping: future.result() releases the GIL internally while waiting.
-    let init_future = Bridge::submit(py, &loop_bound.clone(), init_coro)?;
-    let channel: Bound<'_, PyAny> = init_future.bind(py).call_method1("result", (10.0,))?;
-    let (queue, receive, send): (Bound<'_, PyAny>, Bound<'_, PyAny>, Bound<'_, PyAny>) =
-        channel.extract()?;
-
-    // 2. Build the ASGI HTTP scope (spec_version 2.5).
     let scope = PyDict::new(py);
     scope.set_item("type", "http")?;
     scope.set_item(
@@ -487,91 +592,72 @@ fn establish_inner(
         Some(state) => scope.set_item("state", state.bind(py))?,
         None => scope.set_item("state", PyDict::new(py))?,
     }
-
-    // 3. Submit the application (ASGI 2/3 compatible wrapper).
-    let app_coro = bridge
-        .call_app_fn
-        .bind(py)
-        .call1((app.bind(py), scope, receive, send))?;
-    let app_future = Bridge::submit(py, loop_bound, app_coro)?;
-    Ok(EstablishedCall {
-        app_future,
-        queue: queue.unbind(),
-    })
+    Ok(scope)
 }
 
-/// Enqueue one `http.request` message, waiting for queue capacity.
-///
-/// This is the request-side backpressure path: the queue is bounded
-/// ([`REQUEST_QUEUE_MAXSIZE`]), so a slow application stalls the feeder,
-/// which stalls hyper, which applies TCP backpressure. Blocks the calling
-/// (blocking-pool) thread; the GIL is released while waiting.
-pub fn feed_request_message_sync(
-    loop_obj: &Py<PyAny>,
+/// Enqueue one message with genuine async backpressure (bounded queue).
+/// GIL held only to build the `put` coroutine; the wait parks the Tokio task.
+pub async fn feed_message(
+    locals: &TaskLocals,
     queue: &Py<PyAny>,
-    body: &[u8],
-    more_body: bool,
+    build: impl FnOnce(Python<'_>) -> PyResult<Py<PyAny>>,
+    timeout: std::time::Duration,
 ) -> Result<(), String> {
-    Python::attach(|py| {
-        let loop_bound = loop_obj.bind(py);
-        let msg = PyDict::new(py);
-        msg.set_item("type", "http.request")
-            .and_then(|_| msg.set_item("body", PyBytes::new(py, body)))
-            .and_then(|_| msg.set_item("more_body", PyBool::new(py, more_body)))
-            .map_err(|e| format!("dict: {e}"))?;
-        let put_coro = queue
-            .bind(py)
-            .call_method1("put", (msg,))
-            .map_err(|e| format!("queue.put: {e}"))?;
-        let fut = Bridge::submit(py, loop_bound, put_coro).map_err(|e| format!("submit: {e}"))?;
-        let fut_ref = fut.bind(py);
-        fut_ref
-            .call_method1("result", (60.0,))
+    let put_fut = Python::attach(|py| {
+        let msg = build(py)?;
+        let put_coro = queue.bind(py).call_method1("put", (msg,))?;
+        into_future(locals, put_coro)
+    })
+    .map_err(|e| {
+        Python::attach(|py| e.print(py));
+        "request queue submit failed".to_string()
+    })?;
+    tokio::time::timeout(timeout, put_fut)
+        .await
+        .map_err(|_| "request queue put timed out".to_string())?
+        .map(|_| ())
+        .map_err(|e| {
+            Python::attach(|py| e.print(py));
+            "request queue put failed".to_string()
+        })
+}
+
+/// Deliver one `http.disconnect` (client went away). Fire-and-forget waiter:
+/// schedules a tiny `put_nowait` wrapper and waits at most 5s so shutdown
+/// paths can never hang on it. No threads involved.
+pub async fn feed_disconnect(bridge: &Bridge, locals: &TaskLocals, queue: &Py<PyAny>) {
+    let res: Result<(), String> = async {
+        let coro = Python::attach(|py| {
+            let msg = PyDict::new(py);
+            msg.set_item("type", "http.disconnect")
+                .map_err(|e| format!("dict: {e}"))?;
+            bridge
+                .put_nowait_fn(py)
+                .call1((queue.bind(py), msg))
+                .map_err(|e| {
+                    e.print(py);
+                    "disconnect submit failed".to_string()
+                })
+                .and_then(|c| {
+                    into_future(locals, c).map_err(|e| {
+                        e.print(py);
+                        "disconnect submit failed".to_string()
+                    })
+                })
+        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), coro)
+            .await
+            .map_err(|_| "disconnect wait timed out".to_string())?
             .map(|_| ())
             .map_err(|e| {
-                // Don't strand the put task on the loop.
-                let _ = fut_ref.call_method0("cancel");
-                e.print(py);
-                "request queue put failed".to_string()
+                Python::attach(|py| e.print(py));
+                "disconnect wait failed".to_string()
             })
-    })
-}
-
-/// Enqueue an `http.disconnect` message (client went away mid-request).
-pub fn feed_disconnect(loop_obj: &Py<PyAny>, queue: &Py<PyAny>) {
-    Python::attach(|py| {
-        let _ = (|| -> PyResult<()> {
-            let q = queue.bind(py);
-            let put = q.getattr("put_nowait")?;
-            let msg = PyDict::new(py);
-            msg.set_item("type", "http.disconnect")?;
-            loop_obj
-                .bind(py)
-                .call_method1("call_soon_threadsafe", (put, msg))?;
-            Ok(())
-        })();
-    });
-}
-
-/// Wait for the application future and log any exception (traceback) without
-/// crashing the server. Runs on a blocking-pool thread.
-pub fn await_app_completion(app_future: Py<PyAny>, started: Arc<AtomicBool>, timeout_secs: f64) {
-    Python::attach(|py| {
-        let res = app_future.bind(py).call_method1("result", (timeout_secs,));
-        match res {
-            Ok(_) => {}
-            Err(e) => {
-                e.print(py);
-                if started.load(Ordering::SeqCst) {
-                    eprintln!(
-                        "ERROR rustwasgi: ASGI application raised after response start; connection aborted"
-                    );
-                } else {
-                    eprintln!("ERROR rustwasgi: ASGI application raised; returned 500");
-                }
-            }
-        }
-    });
+    }
+    .await;
+    if let Err(e) = res {
+        eprintln!("WARN rustwasgi: {e}");
+    }
 }
 
 /// Minimal percent-decoder for the ASGI `path` (decoded) vs `raw_path`.

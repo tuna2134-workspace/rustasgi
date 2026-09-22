@@ -44,8 +44,11 @@ Rust + PyO3 ASGI server (hyper/Tokio) deployed as a **Gunicorn custom worker**
   Same for `rx.recv()` on the loop-startup channel (pass ownership with `move`).
 - `loop.call_soon_threadsafe(put, msg)` — pass `(put, msg)`, NOT `(put, (msg,))`
   (PyO3 turns the Rust 1-tuple into a Python tuple and the app gets garbage).
-- Lifespan handshake: submit ONE `queue.get()` and re-`result()` it in slices
-  (fast unsupported detection); always `cancel()` timed-out futures or the
+  (Legacy note: direct threadsafe calls are gone from the request path;
+  only `runtime.rs` loop-stop keeps one, allowlisted in `test_bridge.py`.)
+- Lifespan handshake: race `from_app.get()` vs app-exit vs timeout (no
+  polling); never print tracebacks for "unsupported" (pure-HTTP apps raise
+  by design — one line). Always `cancel()` timed-out futures or the
   loop logs "Task was destroyed but it is pending" at close.
 - Tokio listeners must be created inside the serving runtime's context
   (`rt.enter()` for inherited FDs; `block_on(bind)` for standalone).
@@ -55,6 +58,12 @@ Rust + PyO3 ASGI server (hyper/Tokio) deployed as a **Gunicorn custom worker**
   (no `Option<Py>`/struct `Clone` without GIL — write manual impls),
   `py.detach` closures need owned `Send` captures, `http_body_util::channel`
   needs `features = ["channel"]` and `Channel::new(buffer)`.
+- pyo3-async-runtimes 0.29: `into_future_with_locals(&locals, coro)` is
+  runtime--agnostic (oneshot/waker, await on OUR runtime); `future_into_py*`
+  spawns on the GLOBAL runtime, so call `init_with_runtime(leaked ours)` once
+  post-fork. `TaskLocals::new(loop)` (not `get_current_locals`, which reads
+  the calling thread). Returned futures are `impl Future + Send` — `Box::pin`.
+  `block_on` with GIL held starves the loop thread (same as join).
 - hyper 1.x: `serve_connection(...).with_upgrades()` required for WS;
   `Upgraded` only impls hyper I/O traits — `src/ws.rs` has the Tokio adapter.
 - Gunicorn contract (v26 source of truth in `.venv/.../gunicorn/workers/`):

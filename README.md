@@ -125,21 +125,28 @@ between workers; DB pools/clients/locks initialize in lifespan (post-fork).
 
 ## PyO3 integration
 
-- GIL is held only for: importing the app, building scope dicts, constructing
-  channel objects, submitting coroutines, parsing one `send()` message.
-- GIL is **released** while: hyper does network I/O, Tokio waits, blocking
-  threads wait on `concurrent.futures` results, `SendSink` waits for channel
-  capacity, the loop thread is joined.
+Via `pyo3-async-runtimes` (Tokio backend), not hand-rolled threads:
+
+- Python awaitable → Rust future: `into_future_with_locals` schedules the
+  coroutine onto our explicit loop (fire-and-forget) and completes through a
+  `oneshot` channel. Awaiting it parks the Tokio task — no blocked threads,
+  no condition variables.
+- Rust future → Python awaitable: `future_into_py_with_locals` (used only
+  for backpressured `send()` waits), spawned onto the worker's own Tokio
+  runtime via `init_with_runtime` — no second runtime exists.
+- GIL is held only for microsecond-scale construction/scheduling; **released**
+  across every `.await` (network I/O, channel waits, app execution, loop join).
 - Shutdown deadlock rule (learned the hard way): never `join()` the loop
   thread while holding the GIL — it needs the GIL to run `loop.stop()`.
 
 ## asyncio integration
 
-One dedicated OS thread per worker runs `loop.run_forever()`. Hyper request
-tasks never `block_on` Python: they submit `app(scope, receive, send)` via
-`asyncio.run_coroutine_threadsafe` and wait on the concurrent future from
-`spawn_blocking` (GIL released in the wait). `await asyncio.sleep(...)` and
-arbitrary async I/O work; the loop thread is the only place coroutines run.
+One dedicated OS thread per worker runs `loop.run_forever()`; one shared
+Tokio runtime drives hyper. Request tasks `await` the app future directly —
+no `spawn_blocking`, no `Future.result()`, zero threads per request.
+`await asyncio.sleep(...)` and arbitrary async I/O work; the loop thread is
+the only place coroutines run. Task-local `TaskLocals` pins every conversion
+to the worker's loop from any thread.
 
 ## HTTP implementation
 
@@ -155,12 +162,15 @@ extra keys ignored.
 ## Streaming
 
 - Request: hyper body chunks → bounded `asyncio.Queue(maxsize=64)` via
-  blocking `put` → `await receive()` yields `http.request` with
-  `more_body=True/False`. Backpressure is end-to-end (slow app stalls the
-  feeder stalls hyper stalls TCP). Chunked uploads verified.
-- Response: `send()` → `SendSink` → bounded Tokio mpsc (16) → hyper
-  `Channel` body, chunk-by-chunk; `StreamingResponse` verified incremental.
-  Full channel => `send()` waits with GIL released (bounded memory).
+  `into_future` puts awaited by a Tokio feeder task (no threads).
+  `await receive()` yields `http.request` with `more_body=True/False`.
+  Backpressure is end-to-end (slow app stalls the feeder stalls hyper stalls
+  TCP). Bodyless requests skip the feeder entirely (pre-seeded terminal).
+  Chunked uploads verified.
+- Response: `send()` → `SendSink.try_send` → bounded Tokio mpsc (16) →
+  hyper `Channel` body, chunk-by-chunk; `StreamingResponse` verified
+  incremental. Full channel => `send()` awaits a Rust future with GIL
+  released (bounded memory, zero threads).
 - HEAD suppresses the wire body; headers preserved.
 
 ## WebSocket implementation
@@ -219,42 +229,54 @@ preload/lifespan/timeout-heartbeat/unix-socket, factories, ASGI 2.
 ## Benchmarking
 
 No wrk/hey/ab in this environment; method: threaded keep-alive loader
-(500-request warmup, then 3 rounds), same FastAPI/pure-ASGI apps, same box
-(8 cores), **release** build (`maturin develop --release`).
+(500-request warmup, then measured rounds), same FastAPI/pure-ASGI apps, same
+box (8 cores), **release** build (`maturin develop --release`).
 
-Single worker, `GET /`, concurrency 20, 5000 requests x 3 rounds:
+After the performance refactor (pyo3-async-runtimes bridge, zero-thread
+request path, bodyless fast path, `TCP_NODELAY`), single worker, `GET /`:
 
-| server | rps (avg/min/max) | avg | p50 | p95 | p99 | RSS |
-|---|---|---|---|---|---|---|
-| rustwasgi + FastAPI | 1045 / 1012 / 1071 | 18.8ms | 18.3ms | 29.2ms | 35.4ms | ~50 MiB |
-| uvicorn + FastAPI | 1914 / 1822 / 2015 | 10.5ms | 10.2ms | 13.0ms | 14.1ms | ~48 MiB |
-| rustwasgi + pure ASGI | 994 / 960 / 1027 | 19.9ms | 19.5ms | 29.0ms | 33.6ms | ~28 MiB |
-| uvicorn + pure ASGI | 2353 / 2271 / 2479 | 8.4ms | 8.3ms | 10.8ms | 11.9ms | ~31 MiB |
+| conc | rustwasgi rps | uvicorn rps | ratio | rustwasgi p50/p99 |
+|---|---|---|---|---|
+| 1 | 1281 | 1322 | **97%** | 0.7ms / 1.1ms |
+| 2 | 1655 | 1776 | **93%** | — |
+| 4 | 1913 | 1835 | **104%** | — |
+| 8 | 1892 | 1934 | **98%** | — |
+| 16 | 2191 | 2041 | **107%** | — |
+| 20 | 2030 | 1850 | **110%** | 9.5ms / 19.9ms |
+| 32 | 2167 | 1712 | **127%** | — |
+| 64 | 1984 | 1838 | **108%** | — |
 
-Single connection latency (concurrency 1, pure ASGI): rustwasgi 1.4ms avg.
+Pure ASGI tracks FastAPI on both servers (bridge cost, not framework cost).
+RSS on par (~48 MiB both). Single-worker CPU at conc 20: rustwasgi ~140%
+(Tokio pool + loop thread), uvicorn ~95%.
 
-Production path (Gunicorn master, 4 workers), concurrency 50, 10000 x 3:
+Production path (Gunicorn master, 4 workers), conc 50, 10000 x 3:
 
 | server | rps (avg) | avg | p50 | p95 | p99 |
 |---|---|---|---|---|---|
-| gunicorn + RustWASGIWorker | 2087 | ~19.8ms | ~19ms | ~33.8ms | ~41.3ms |
-| gunicorn + UvicornWorker | 3876 | ~12.0ms | ~10.5ms | ~25.7ms | ~35.8ms |
+| gunicorn + RustWASGIWorker | **3175** | ~14.5ms | ~13ms | ~30.7ms | ~41.4ms |
+| gunicorn + UvicornWorker | **3792** | ~12.2ms | ~10.7ms | ~26.0ms | ~35.8ms |
+
+Bridge microbenchmark (`_bench_bridge`: into_future round-trip ms/op at
+1/4/8/16/20/32/64 concurrency): **0.150 / 0.145 / 0.124 / 0.091 / 0.095 /
+0.086 / 0.080** — flat-to-improving, vs the old bridge's 0.083 idle →
+1.77 contended (21x blowup, gone).
 
 Findings, reported without spin:
 
 - Pure-ASGI ≈ FastAPI on rustwasgi ⇒ cost is bridge overhead, not the
-  framework. Per-request true service is ~1.4ms (vs ~0.4ms on uvicorn);
-  everything funnels through one asyncio loop thread plus GIL/thread hops
-  (`run_coroutine_threadsafe` + blocking waits per request).
+  framework. Single-connection service is ~0.8ms (uvicorn ~0.76ms): one
+  loop wakeup for the app submit plus scope/sink construction.
 - A 42ms floor in early runs turned out to be Nagle/delayed-ACK (no
   `TCP_NODELAY` on the standalone socket) — fixed, 30x latency win, and a
-  reminder to distrust first numbers.
+  reminder to distrust first numbers. (Uvicorn's `--workers 4` supervisor
+  mode shows the same 42ms signature — its own socket setup, not ours.)
 - A benchmark-triggered `IncompleteRead` exposed a real drain bug
   (in-flight counter dropped at response headers while the body still
   streamed); fixed with an RAII guard covering pump/WS-driver lifetime.
-- No superiority claimed. Next profiling targets: fewer threadsafe
-  round-trips per request (combined init+app submit, fire-and-forget
-  terminal body put), release LTO.
+- rustwasgi spends more CPU per request (thread hops + GIL transitions
+  across Tokio workers) but converts it into equal-or-better throughput at
+  concurrency ≥ 4 by never parking threads: all waits are waker-based.
 
 ## Security
 

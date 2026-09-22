@@ -1,24 +1,34 @@
-//! hyper HTTP server owning the network sockets.
+//! hyper HTTP server owning the network sockets — zero-thread request path.
 //!
 //! hyper owns every accept loop and all HTTP/1 parsing (keep-alive included).
 //! Each request is translated to ASGI in `asgi.rs`, executed on the asyncio
-//! loop thread, and streamed back through hyper's `Channel` body.
+//! loop, and streamed back through hyper's `Channel` body. At no point does a
+//! Tokio task block an OS thread waiting for Python, and no Python execution
+//! blocks waiting for Rust: the two sides meet only through
+//! `pyo3-async-runtimes` waker channels.
 //!
-//! Per-request flow (all network I/O stays on Tokio; Python runs only on the
-//! loop thread or short blocking-pool hops with the GIL released in waits):
+//! Per-request flow (bodyless `GET /`, the hot path):
 //!
 //! ```text
-//! hyper Incoming body --chunks--> feeder task --blocking queue.put--> asyncio.Queue
-//!                                                                          | await
-//!                                                              Python await receive()
-//! Python await send(msg) --SendSink._push--> tokio mpsc (bound 16)
-//!                                                  | rx.recv().await
-//! hyper Channel body <--pump task--------------+--> TCP socket
+//! hyper request (Tokio task, GIL-free)
+//!   | attach GIL (µs): build scope, init coroutine, into_future
+//!   v
+//! loop thread runs init (queue + pre-seeded terminal receive + send)
+//!   | attach GIL (µs): build app coroutine, into_future
+//!   v
+//! loop thread runs FastAPI <--- no feeder task (no body) ---
+//!   | app send()s stream via try_send into mpsc(16)
+//!   v
+//! pump task: rx.recv().await --> hyper Channel --> TCP
+//! app completion: into_future awaited directly (traceback on Err)
 //! ```
+//!
+//! With a body, one extra Tokio feeder task awaits `queue.put` through
+//! `into_future` (async backpressure, no threads).
 //!
 //! Gunicorn cooperation: heartbeat (`notify`), liveness (`is_alive`),
 //! request counting for `max_requests` recycling, and access-log callbacks
-//! are driven from Rust tasks that briefly acquire the GIL.
+//! are driven from plain Tokio tasks that attach the GIL briefly.
 
 use std::sync::{
     Arc,
@@ -37,16 +47,18 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use pyo3::prelude::*;
+use pyo3_async_runtimes::TaskLocals;
 use tokio::task::JoinSet;
 
-use crate::asgi::{self, Bridge, RESPONSE_CHANNEL_BOUND, RequestData, ResponseEvent, SendSink};
+use crate::asgi::{self, Bridge, RequestData, ResponseEvent, SendSink};
+use crate::asgi::{REQUEST_PUT_TIMEOUT, RESPONSE_CHANNEL_BOUND};
 use crate::socket::BoundListener;
 use crate::ws;
 
 type RespBody = BoxBody<Bytes, hyper::Error>;
 
 const FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-const APP_COMPLETION_TIMEOUT: f64 = 300.0;
+const APP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Runtime knobs for one worker process.
 #[derive(Clone)]
@@ -62,8 +74,8 @@ pub struct ServeConfig {
     pub keep_alive_secs: u64,
 }
 
-/// Callbacks into the Python (Gunicorn) worker. All are thread-safe to invoke
-/// via `Python::attach` from any thread; each call holds the GIL briefly.
+/// Callbacks into the Python (Gunicorn) worker. Invoked via brief
+/// `Python::attach` from Tokio tasks — never waited on, never blocking.
 pub struct WorkerHooks {
     /// `worker.notify()` heartbeat.
     pub notify: Py<PyAny>,
@@ -96,8 +108,8 @@ impl WorkerHooks {
 
 struct AppState {
     app: Py<PyAny>,
-    loop_obj: Py<PyAny>,
     bridge: Bridge,
+    locals: TaskLocals,
     lifespan_state: Option<Py<PyAny>>,
     config: ServeConfig,
     hooks: WorkerHooks,
@@ -151,12 +163,13 @@ impl Shutdown {
     }
 }
 
-/// Serve all listeners until shutdown. Returns when drained.
+/// Serve all listeners until shutdown. Returns when drained; connection
+/// tasks are aborted so a leaked runtime is never needed for teardown.
 pub async fn serve(
     listeners: Vec<BoundListener>,
     app: Py<PyAny>,
-    loop_obj: Py<PyAny>,
     bridge: Bridge,
+    locals: TaskLocals,
     lifespan_state: Option<Py<PyAny>>,
     config: ServeConfig,
     hooks: WorkerHooks,
@@ -172,8 +185,8 @@ pub async fn serve(
 
     let state = Arc::new(AppState {
         app,
-        loop_obj,
         bridge,
+        locals,
         lifespan_state,
         config,
         hooks,
@@ -181,12 +194,13 @@ pub async fn serve(
     let shutdown = Arc::new(Shutdown::new());
     let in_flight = Arc::new(AtomicUsize::new(0));
     let completed = Arc::new(AtomicUsize::new(0));
+    // All connection tasks: aborted after the drain so nothing outlives serve.
+    let connections: Arc<tokio::sync::Mutex<JoinSet<()>>> =
+        Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
 
     // Signal watcher: SIGTERM -> graceful, SIGQUIT/SIGINT -> quick.
     // (Cooperates with Gunicorn: it sends these; Python-level handlers fire
     // once control returns to the interpreter after run_worker() returns.)
-    // The watcher exits when `serve_done` fires so runtime shutdown never
-    // hangs on it.
     let (serve_done_tx, serve_done_rx) = tokio::sync::watch::channel(false);
     {
         let shutdown = shutdown.clone();
@@ -194,7 +208,7 @@ pub async fn serve(
             watch_signals(shutdown, serve_done_rx).await;
         });
     }
-    // Heartbeat + liveness + orphan detection.
+    // Heartbeat + liveness + orphan detection (plain async task, no threads).
     {
         let state = state.clone();
         let shutdown = shutdown.clone();
@@ -210,6 +224,7 @@ pub async fn serve(
         let shutdown = shutdown.clone();
         let in_flight = in_flight.clone();
         let completed = completed.clone();
+        let connections = connections.clone();
         acceptors.spawn(async move {
             match listener {
                 BoundListener::Tcp {
@@ -234,10 +249,8 @@ pub async fn serve(
                                 continue;
                             }
                         };
-                        // Disable Nagle: ASGI responses are small writes that
-                        // would otherwise wait ~40ms for delayed ACKs.
-                        // (Gunicorn pre-sets this on inherited sockets; the
-                        // standalone path must do it here.)
+                        // Disable Nagle: small ASGI responses would otherwise
+                        // wait ~40ms for delayed ACKs.
                         if let Err(e) = stream.set_nodelay(true) {
                             eprintln!("WARN rustwasgi: set_nodelay failed: {e}");
                         }
@@ -252,7 +265,9 @@ pub async fn serve(
                             &shutdown,
                             &in_flight,
                             &completed,
-                        );
+                            &connections,
+                        )
+                        .await;
                     }
                 }
                 BoundListener::Unix {
@@ -291,7 +306,9 @@ pub async fn serve(
                             &shutdown,
                             &in_flight,
                             &completed,
-                        );
+                            &connections,
+                        )
+                        .await;
                     }
                 }
             }
@@ -324,13 +341,15 @@ pub async fn serve(
             eprintln!("INFO rustwasgi: shutdown complete");
         }
     }
-    // Release the signal watcher so runtime shutdown cannot hang on it.
+    // Abort leftover (idle keep-alive) connections, release the watcher.
+    connections.lock().await.abort_all();
+    while connections.lock().await.join_next().await.is_some() {}
     let _ = serve_done_tx.send(true);
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_connection<I>(
+async fn spawn_connection<I>(
     io: I,
     client_host: String,
     client_port: u16,
@@ -340,6 +359,7 @@ fn spawn_connection<I>(
     shutdown: &Arc<Shutdown>,
     in_flight: &Arc<AtomicUsize>,
     completed: &Arc<AtomicUsize>,
+    connections: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -348,7 +368,7 @@ fn spawn_connection<I>(
     let in_flight = in_flight.clone();
     let completed = completed.clone();
     let keep_alive_secs = state.config.keep_alive_secs;
-    tokio::spawn(async move {
+    let task = async move {
         let service = service_fn(move |req: Request<Incoming>| {
             let state = state.clone();
             let shutdown = shutdown.clone();
@@ -385,7 +405,8 @@ fn spawn_connection<I>(
         {
             eprintln!("WARN rustwasgi: connection error: {e}");
         }
-    });
+    };
+    connections.lock().await.spawn(task);
 }
 
 /// Build per-connection hyper options from the worker config.
@@ -427,7 +448,7 @@ async fn watch_signals(shutdown: Arc<Shutdown>, mut done: tokio::sync::watch::Re
                 }
                 _ = done.changed() => break,
             }
-            if done.borrow().to_owned() {
+            if *done.borrow() {
                 break;
             }
         }
@@ -444,8 +465,6 @@ async fn heartbeat_loop(state: Arc<AppState>, shutdown: Arc<Shutdown>) {
     let interval = state.config.heartbeat_interval;
     #[cfg(unix)]
     let start_ppid = std::os::unix::process::parent_id();
-    #[cfg(not(unix))]
-    let start_ppid = 0u32;
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -460,23 +479,20 @@ async fn heartbeat_loop(state: Arc<AppState>, shutdown: Arc<Shutdown>) {
             shutdown.trigger(ShutdownKind::Quick);
             break;
         }
+        // Brief GIL attach: two quick calls, never waited on.
         let hooks = state.hooks.clone_for_task();
-        let alive: bool = tokio::task::spawn_blocking(move || {
-            Python::attach(|py| {
-                if let Err(e) = hooks.notify.bind(py).call0() {
-                    e.print(py);
-                    eprintln!("WARN rustwasgi: heartbeat notify() failed");
-                }
-                hooks
-                    .is_alive
-                    .bind(py)
-                    .call0()
-                    .and_then(|v| v.extract::<bool>())
-                    .unwrap_or(true)
-            })
-        })
-        .await
-        .unwrap_or(true);
+        let alive: bool = Python::attach(|py| {
+            if let Err(e) = hooks.notify.bind(py).call0() {
+                e.print(py);
+                eprintln!("WARN rustwasgi: heartbeat notify() failed");
+            }
+            hooks
+                .is_alive
+                .bind(py)
+                .call0()
+                .and_then(|v| v.extract::<bool>())
+                .unwrap_or(true)
+        });
         if !alive {
             eprintln!("INFO rustwasgi: worker marked not alive; shutting down");
             shutdown.trigger(ShutdownKind::Graceful);
@@ -578,7 +594,7 @@ async fn handle_websocket_upgrade(
 
     let ctx = ws::WsContext {
         bridge: state.bridge.clone(),
-        loop_obj: Python::attach(|py| state.loop_obj.clone_ref(py)),
+        locals: state.locals.clone(),
         app: Python::attach(|py| state.app.clone_ref(py)),
         handshake,
         lifespan_state: Python::attach(|py| {
@@ -629,8 +645,26 @@ async fn handle_http(
     let uri = parts.uri.clone();
     let path_raw = uri.path().to_string();
     let mut headers = Vec::new();
+    // Bodyless fast-path detection: chunked framing or a positive
+    // Content-Length means a body may stream; anything else (GET/HEAD/...) is
+    // declared bodyless and gets a zero-hop pre-seeded terminal message.
+    // (Malformed lengths take the streaming path; hyper arbitrates.)
+    let mut has_body = false;
     for (name, value) in parts.headers.iter() {
         headers.push((name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()));
+        if name == http::header::TRANSFER_ENCODING {
+            has_body = true;
+        } else if name == http::header::CONTENT_LENGTH {
+            let positive = value
+                .to_str()
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|n| n > 0)
+                .unwrap_or(true);
+            if positive {
+                has_body = true;
+            }
+        }
     }
     let data = RequestData {
         method: method.clone(),
@@ -641,6 +675,7 @@ async fn handle_http(
         query_string: uri.query().unwrap_or("").as_bytes().to_vec(),
         root_path: state.config.root_path.clone(),
         headers,
+        has_body,
         client_host: client_host.to_string(),
         client_port,
         server_host: server_host.to_string(),
@@ -649,35 +684,34 @@ async fn handle_http(
     let path_for_log = data.path.clone();
     let query_for_log = String::from_utf8_lossy(&data.query_string).into_owned();
 
-    // Response channel + sink; the app task is established on a
-    // blocking-pool thread (GIL only for setup + released in waits).
+    // Response channel + sink; the app task is established with pure async
+    // awaits (GIL only for microsecond-scale construction).
     let disconnected = Arc::new(AtomicBool::new(false));
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ResponseEvent>(RESPONSE_CHANNEL_BOUND);
-    let established = {
-        let bridge = state.bridge.clone();
-        let loop_c = Python::attach(|py| state.loop_obj.clone_ref(py));
-        let app_c = Python::attach(|py| state.app.clone_ref(py));
-        let st_c = Python::attach(|py| crate::runtime::clone_opt_py(py, &state.lifespan_state));
-        let sink = Python::attach(|py| {
-            SendSink::new(tx, disconnected.clone())
-                .into_pyobject(py)
-                .map(|b| b.unbind())
-        });
-        let sink = match sink {
-            Ok(s) => s,
-            Err(e) => {
-                Python::attach(|py| e.print(py));
-                return status_response(500, "Internal Server Error");
-            }
-        };
-        tokio::task::spawn_blocking(move || {
-            asgi::establish_http_call(&bridge, &loop_c, &app_c, st_c.as_ref(), &data, sink)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("establish task failed: {e}")))
+    let sink = match Python::attach(|py| {
+        SendSink::new(tx, disconnected.clone(), state.locals.clone())
+            .into_pyobject(py)
+            .map(|b| b.unbind())
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            Python::attach(|py| e.print(py));
+            return status_response(500, "Internal Server Error");
+        }
     };
-    let (queue, app_future) = match established {
-        Ok(call) => (call.queue, call.app_future),
+    let app_c = Python::attach(|py| state.app.clone_ref(py));
+    let st_c = Python::attach(|py| crate::runtime::clone_opt_py(py, &state.lifespan_state));
+    let established = asgi::establish_http_call(
+        &state.bridge,
+        &state.locals,
+        &app_c,
+        st_c.as_ref(),
+        &data,
+        sink,
+    )
+    .await;
+    let (queue, app_fut) = match established {
+        Ok(call) => (call.queue, call.app_fut),
         Err(e) => {
             eprintln!("ERROR rustwasgi: {e}");
             log_access(
@@ -694,28 +728,37 @@ async fn handle_http(
             return status_response(500, "Internal Server Error");
         }
     };
+    let queue_c = Python::attach(|py| queue.clone_ref(py));
+    let queue_f = Python::attach(|py| queue.clone_ref(py));
 
-    // App completion monitor: logs tracebacks, marks done for the feeder.
-    let app_done = Arc::new(AtomicBool::new(false));
-    let started_flag = Arc::new(AtomicBool::new(false));
+    // App reaper: awaits completion directly (traceback preserved in PyErr),
+    // then releases the feeder. No monitor thread.
+    let (app_done_tx, app_done_rx) = tokio::sync::watch::channel(false);
     {
-        let fut_c = Python::attach(|py| app_future.clone_ref(py));
-        let done = app_done.clone();
-        let started = started_flag.clone();
-        tokio::task::spawn_blocking(move || {
-            asgi::await_app_completion(fut_c, started, APP_COMPLETION_TIMEOUT);
-            done.store(true, Ordering::SeqCst);
+        tokio::spawn(async move {
+            let res = tokio::time::timeout(APP_COMPLETION_TIMEOUT, app_fut).await;
+            match res {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    Python::attach(|py| e.print(py));
+                    eprintln!("ERROR rustwasgi: ASGI application raised");
+                }
+                Err(_) => {
+                    eprintln!("ERROR rustwasgi: ASGI application timed out; dropping");
+                }
+            }
+            let _ = app_done_tx.send(true);
         });
     }
 
-    // Request body feeder: streams hyper chunks into the asyncio queue with
-    // bounded puts (backpressure). hyper already decoded chunked framing.
-    {
-        let loop_c = Python::attach(|py| state.loop_obj.clone_ref(py));
-        let queue_c = Python::attach(|py| queue.clone_ref(py));
-        let done = app_done.clone();
+    // Request body feeder: a plain Tokio task (none spawned when bodyless —
+    // the terminal message was pre-seeded). Puts await through into_future:
+    // genuine async backpressure, zero threads.
+    if has_body {
+        let locals_c = state.locals.clone();
+        let bridge_c = state.bridge.clone();
         tokio::spawn(async move {
-            feed_body(body, &loop_c, &queue_c, &done).await;
+            feed_body(body, &bridge_c, &locals_c, &queue_f, app_done_rx).await;
         });
     }
 
@@ -725,15 +768,11 @@ async fn handle_http(
         Ok(Some(ResponseEvent::Start { status, headers })) => (status, headers),
         Ok(Some(ResponseEvent::Body { .. })) => {
             eprintln!("ERROR rustwasgi: app sent body before response.start");
-            app_done.store(true, Ordering::SeqCst);
-            asgi::feed_disconnect(
-                &Python::attach(|py| state.loop_obj.clone_ref(py)),
-                &Python::attach(|py| queue.clone_ref(py)),
-            );
+            asgi::feed_disconnect(&state.bridge, &state.locals, &queue_c).await;
             return status_response(500, "Internal Server Error");
         }
         Ok(None) => {
-            // App raised before responding; traceback logged by monitor.
+            // App raised before responding; traceback logged by the reaper.
             log_access(
                 state,
                 &method,
@@ -763,7 +802,6 @@ async fn handle_http(
             return status_response(500, "Internal Server Error");
         }
     };
-    started_flag.store(true, Ordering::SeqCst);
 
     let (body_sender, channel_body): (
         BodySender<Bytes, hyper::Error>,
@@ -791,8 +829,8 @@ async fn handle_http(
     // Response pump: forwards chunks; HEAD suppresses the wire body.
     // It owns `guard`, so graceful drain waits for the full body.
     {
-        let loop_c = Python::attach(|py| state.loop_obj.clone_ref(py));
-        let queue_c = Python::attach(|py| queue.clone_ref(py));
+        let bridge_c = state.bridge.clone();
+        let locals_c = state.locals.clone();
         let disc = disconnected.clone();
         let client_label = client_host.to_string();
         let state_c = state_for_task(state);
@@ -811,7 +849,7 @@ async fn handle_http(
                                 // Client gone: fail fast future sends (OSError
                                 // per ASGI 2.4+) and wake a pending receive().
                                 disc.store(true, Ordering::SeqCst);
-                                asgi::feed_disconnect(&loop_c, &queue_c);
+                                asgi::feed_disconnect(&bridge_c, &locals_c, &queue_c).await;
                                 break;
                             }
                         } else if is_head {
@@ -844,80 +882,100 @@ async fn handle_http(
 
 // AppState is not Clone (Py fields need the GIL); re-clone cheaply per task.
 fn state_for_task(state: &AppState) -> TaskState {
-    Python::attach(|py| TaskState {
-        loop_obj: state.loop_obj.clone_ref(py),
+    TaskState {
         hooks: state.hooks.clone_for_task(),
         access_log: state.config.access_log,
-    })
+    }
 }
 
 struct TaskState {
-    loop_obj: Py<PyAny>,
     hooks: WorkerHooks,
     access_log: bool,
 }
 
-/// Stream the hyper request body into the app queue, chunk by chunk.
-/// Stops early if the app finished (e.g. it replied without reading).
-///
-/// Ordering is critical: every message (data and the terminal EOF) goes
-/// through the same blocking `queue.put`, so the app can never observe EOF
-/// before pending data.
+/// Stream the hyper request body into the app queue, chunk by chunk, with
+/// async backpressure (`into_future` puts, never blocking). Stops when the
+/// body ends, errors, the app finishes, or shutdown trips.
+#[allow(clippy::too_many_arguments)]
 async fn feed_body(
     body: Incoming,
-    loop_obj: &Py<PyAny>,
+    bridge: &Bridge,
+    locals: &TaskLocals,
     queue: &Py<PyAny>,
-    app_done: &Arc<AtomicBool>,
+    mut app_done: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut body = body;
-    let mut ok = true;
     loop {
-        if app_done.load(Ordering::SeqCst) {
-            ok = false;
+        if *app_done.borrow() {
             break;
         }
-        let frame = match body.frame().await {
-            Some(Ok(f)) => f,
-            Some(Err(_)) | None => break,
+        let frame = tokio::select! {
+            biased;
+            _ = app_done.changed() => break,
+            res = body.frame() => match res {
+                Some(Ok(f)) => Some(f),
+                Some(Err(_)) | None => None,
+            },
         };
-        if let Some(data) = frame.data_ref() {
-            if data.is_empty() {
-                continue;
-            }
-            let chunk = data.to_vec();
-            if put_body_chunk(loop_obj, queue, &chunk, true).await.is_err() {
-                ok = false;
-                break;
+        let frame = match frame {
+            Some(f) => f,
+            None => break,
+        };
+        let chunk = match frame.into_data() {
+            Ok(data) if !data.is_empty() => data.to_vec(),
+            _ => continue, // metadata frames: no trailer support, skip.
+        };
+        // Ordered blocking-free put with backpressure; abort on app end.
+        let put = async {
+            asgi::feed_message(
+                locals,
+                queue,
+                |py| {
+                    use pyo3::types::{PyBool, PyBytes, PyDict};
+                    let msg = PyDict::new(py);
+                    msg.set_item("type", "http.request")?;
+                    msg.set_item("body", PyBytes::new(py, &chunk))?;
+                    msg.set_item("more_body", PyBool::new(py, true))?;
+                    Ok(msg.into_any().unbind())
+                },
+                REQUEST_PUT_TIMEOUT,
+            )
+            .await
+        };
+        tokio::select! {
+            biased;
+            _ = app_done.changed() => break,
+            res = put => {
+                if res.is_err() {
+                    // App gone or queue broken: wake a pending receive with
+                    // disconnect and stop feeding.
+                    asgi::feed_disconnect(bridge, locals, queue).await;
+                    break;
+                }
             }
         }
-        // Trailers/metadata frames are ignored (no trailer support).
     }
     // Terminal EOF through the same ordered path (unless the app is gone).
-    if ok && !app_done.load(Ordering::SeqCst) {
-        let _ = put_body_chunk(loop_obj, queue, b"", false).await;
+    if !*app_done.borrow() {
+        let _ = asgi::feed_message(
+            locals,
+            queue,
+            |py| {
+                use pyo3::types::{PyBool, PyBytes, PyDict};
+                let msg = PyDict::new(py);
+                msg.set_item("type", "http.request")?;
+                msg.set_item("body", PyBytes::new(py, b""))?;
+                msg.set_item("more_body", PyBool::new(py, false))?;
+                Ok(msg.into_any().unbind())
+            },
+            REQUEST_PUT_TIMEOUT,
+        )
+        .await;
     }
-}
-
-/// One ordered blocking `queue.put` hop for a body message.
-async fn put_body_chunk(
-    loop_obj: &Py<PyAny>,
-    queue: &Py<PyAny>,
-    chunk: &[u8],
-    more_body: bool,
-) -> Result<(), ()> {
-    let loop_c = Python::attach(|py| loop_obj.clone_ref(py));
-    let queue_c = Python::attach(|py| queue.clone_ref(py));
-    // Bounded put: backpressure propagates to hyper/TCP.
-    let owned = chunk.to_vec();
-    tokio::task::spawn_blocking(move || {
-        asgi::feed_request_message_sync(&loop_c, &queue_c, &owned, more_body)
-    })
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())
 }
 
 /// Emit one access-log entry via the Python hook (Gunicorn atoms) or stderr.
+/// Brief GIL attach for a fast call; nothing waited on.
 #[allow(clippy::too_many_arguments)]
 async fn log_access(
     state: &AppState,
@@ -940,23 +998,15 @@ async fn log_access(
     let enabled = state.config.access_log;
     if let Some(access) = hook {
         let status_u = status as u64;
-        tokio::task::spawn_blocking(move || {
-            Python::attach(|py| {
-                if let Err(e) = access.bind(py).call1((
-                    method,
-                    path,
-                    query,
-                    status_u,
-                    size,
-                    duration_ms,
-                    client,
-                )) {
-                    e.print(py);
-                }
-            });
-        })
-        .await
-        .ok();
+        Python::attach(|py| {
+            if let Err(e) =
+                access
+                    .bind(py)
+                    .call1((method, path, query, status_u, size, duration_ms, client))
+            {
+                e.print(py);
+            }
+        });
     } else if enabled {
         eprintln!(
             "INFO rustwasgi: {client} \"{method} {path}\" {status} {size} {duration_ms:.1}ms"
@@ -986,29 +1036,20 @@ async fn log_access_task(
     let enabled = state.access_log;
     if let Some(access) = hook {
         let status_u = status as u64;
-        tokio::task::spawn_blocking(move || {
-            Python::attach(|py| {
-                if let Err(e) = access.bind(py).call1((
-                    method,
-                    path,
-                    query,
-                    status_u,
-                    size,
-                    duration_ms,
-                    client,
-                )) {
-                    e.print(py);
-                }
-            });
-        })
-        .await
-        .ok();
+        Python::attach(|py| {
+            if let Err(e) =
+                access
+                    .bind(py)
+                    .call1((method, path, query, status_u, size, duration_ms, client))
+            {
+                e.print(py);
+            }
+        });
     } else if enabled {
         eprintln!(
             "INFO rustwasgi: {client} \"{method} {path}\" {status} {size} {duration_ms:.1}ms"
         );
     }
-    let _ = &state.loop_obj;
 }
 
 fn empty_body() -> RespBody {
