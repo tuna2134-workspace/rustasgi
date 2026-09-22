@@ -46,7 +46,7 @@ use crate::socket::{BoundListener, InheritedSocket};
 
 /// Run the standalone ASGI server (blocking until SIGINT/SIGTERM).
 #[pyfunction]
-#[pyo3(signature = (app, *, host="127.0.0.1", port=8000, workers=1, log_level="info", root_path="", lifespan="auto", access_log=false, keep_alive=0, tls_cert=None, tls_key=None, redirect_http_to_https=false, acme_directory=None, acme_email=None, acme_domains=Vec::new(), acme_dir=None))]
+#[pyo3(signature = (app, *, host="127.0.0.1", port=8000, workers=1, log_level="info", root_path="", lifespan="auto", access_log=false, keep_alive=0, tls_cert=None, tls_key=None, redirect_http_to_https=false, acme_directory=None, acme_email=None, acme_domains=Vec::new(), acme_dir=None, tls_sni=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 fn run(
     py: Python<'_>,
@@ -66,6 +66,7 @@ fn run(
     acme_email: Option<String>,
     acme_domains: Vec<String>,
     acme_dir: Option<String>,
+    tls_sni: Vec<String>,
 ) -> PyResult<()> {
     // Env fallback for ACME domains if not passed (Gunicorn path may use env)
     let acme_domains = if acme_domains.is_empty() {
@@ -78,6 +79,14 @@ fn run(
     };
     let tls_cert = tls_cert.or_else(|| std::env::var("RUSTWASGI_TLS_CERT").ok().filter(|s| !s.is_empty()));
     let tls_key = tls_key.or_else(|| std::env::var("RUSTWASGI_TLS_KEY").ok().filter(|s| !s.is_empty()));
+    let tls_sni = if tls_sni.is_empty() {
+        std::env::var("RUSTWASGI_TLS_SNI")
+            .ok()
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default()
+    } else {
+        tls_sni
+    };
     let config = ServerConfig::new(
         app.clone(),
         host.to_string(),
@@ -94,6 +103,7 @@ fn run(
         acme_email.or_else(|| std::env::var("RUSTWASGI_ACME_EMAIL").ok()),
         acme_domains,
         acme_dir.or_else(|| std::env::var("RUSTWASGI_ACME_DIR").ok()),
+        tls_sni,
     );
     if workers > 1 {
         config.log_warn(&format!(

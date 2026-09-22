@@ -39,6 +39,8 @@ pub struct ServerConfig {
     pub acme_domains: Vec<String>,
     /// ACME storage directory
     pub acme_dir: Option<String>,
+    /// SNI entries as `domain:cert:key` strings (for multiple certs)
+    pub tls_sni: Vec<String>,
 }
 
 impl ServerConfig {
@@ -59,6 +61,7 @@ impl ServerConfig {
         acme_email: Option<String>,
         acme_domains: Vec<String>,
         acme_dir: Option<String>,
+        tls_sni: Vec<String>,
     ) -> Self {
         Self {
             app_spec,
@@ -76,6 +79,7 @@ impl ServerConfig {
             acme_email,
             acme_domains,
             acme_dir,
+            tls_sni,
         }
     }
 
