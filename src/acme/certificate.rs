@@ -1,9 +1,8 @@
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
-use crate::tls::{TlsState, TlsError};
+use crate::tls::TlsState;
 
 /// Atomically install cert and key, then reload TLS state
 /// Writes to temp files, fsync, rename, then validates and activates
@@ -46,10 +45,10 @@ pub fn atomic_install(
     fs::rename(&key_tmp, key_path).map_err(|e| format!("rename key: {e}"))?;
 
     // Fsync directory for durability (best effort)
-    if let Some(dir) = cert_path.parent() {
-        if let Ok(f) = File::open(dir) {
-            let _ = f.sync_all();
-        }
+    if let Some(dir) = cert_path.parent()
+        && let Ok(f) = File::open(dir)
+    {
+        let _ = f.sync_all();
     }
 
     // Reload in-memory

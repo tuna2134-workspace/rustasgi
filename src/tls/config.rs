@@ -13,7 +13,10 @@ pub enum TlsError {
     #[error("private key file not found: {0}")]
     KeyNotFound(PathBuf),
     #[error("failed to read {path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to parse certificate {path}: {reason}")]
     CertParse { path: PathBuf, reason: String },
     #[error("failed to parse private key {path}: {reason}")]
@@ -31,6 +34,7 @@ pub enum TlsError {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TlsConfig {
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
@@ -38,6 +42,7 @@ pub struct TlsConfig {
     pub sni_entries: Vec<(String, PathBuf, PathBuf)>,
 }
 
+#[allow(dead_code)]
 impl TlsConfig {
     pub fn single(cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
         Self {
@@ -57,19 +62,28 @@ pub fn load_cert_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsE
         if e.kind() == std::io::ErrorKind::NotFound {
             TlsError::CertNotFound(path.to_path_buf())
         } else {
-            TlsError::Io { path: path.to_path_buf(), source: e }
+            TlsError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }
         }
     })?;
     let mut reader = BufReader::new(file);
     let certs = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| TlsError::CertParse { path: path.to_path_buf(), reason: e.to_string() })?;
+        .map_err(|e| TlsError::CertParse {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
     if certs.is_empty() {
         return Err(TlsError::NoCerts(path.to_path_buf()));
     }
     for der in &certs {
         if der.is_empty() {
-            return Err(TlsError::InvalidChain(format!("empty cert in {}", path.display())));
+            return Err(TlsError::InvalidChain(format!(
+                "empty cert in {}",
+                path.display()
+            )));
         }
     }
     Ok(certs)
@@ -80,20 +94,22 @@ pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError>
         if e.kind() == std::io::ErrorKind::NotFound {
             TlsError::KeyNotFound(path.to_path_buf())
         } else {
-            TlsError::Io { path: path.to_path_buf(), source: e }
+            TlsError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }
         }
     })?;
     let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| TlsError::KeyParse { path: path.to_path_buf(), reason: e.to_string() })?;
+    let key = rustls_pemfile::private_key(&mut reader).map_err(|e| TlsError::KeyParse {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
     key.ok_or_else(|| TlsError::NoKey(path.to_path_buf()))
 }
 
 /// Build a rustls ServerConfig from a single cert/key pair (no SNI)
-pub fn build_single_config(
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<ServerConfig, TlsError> {
+pub fn build_single_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig, TlsError> {
     let certs = load_cert_chain(cert_path)?;
     let key = load_private_key(key_path)?;
     validate_pair(&certs, &key)?;
@@ -120,7 +136,9 @@ pub fn build_sni_config(
         let key = load_private_key(key_path)?;
         let ck = rustls::sign::CertifiedKey::from_der(certs, key, &provider)
             .map_err(|e| TlsError::KeyMismatch(e.to_string()))?;
-        resolver.add(domain, ck).map_err(|e| TlsError::Rustls(e.to_string()))?;
+        resolver
+            .add(domain, ck)
+            .map_err(|e| TlsError::Rustls(e.to_string()))?;
     }
     if let Some((cert_path, key_path)) = default_cert {
         let certs = load_cert_chain(cert_path)?;
@@ -131,8 +149,7 @@ pub fn build_sni_config(
         // Build config with default cert then override resolver to SNI-aware one with fallback
         let mut cfg = ServerConfig::builder()
             .with_no_client_auth()
-            .with_cert_resolver(Arc::new(resolver))
-            ;
+            .with_cert_resolver(Arc::new(resolver));
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(cfg)
     } else {
@@ -153,7 +170,8 @@ pub fn validate_pair(
         .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
     let ck = rustls::sign::CertifiedKey::from_der(certs.to_vec(), key.clone_key(), &provider)
         .map_err(|e| TlsError::KeyMismatch(e.to_string()))?;
-    ck.keys_match().map_err(|e| TlsError::KeyMismatch(e.to_string()))?;
+    ck.keys_match()
+        .map_err(|e| TlsError::KeyMismatch(e.to_string()))?;
     // Check SAN / validity via x509-parser
     if let Some(first) = certs.first() {
         use x509_parser::prelude::*;
@@ -171,7 +189,9 @@ mod tests {
     use rcgen::{CertificateParams, DistinguishedName, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    fn generate_self_signed(domains: &[String]) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    fn generate_self_signed(
+        domains: &[String],
+    ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
         let mut params = CertificateParams::new(domains.to_vec()).unwrap();
         params.distinguished_name = DistinguishedName::new();
         let key_pair = KeyPair::generate().unwrap();

@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::ServerConfig;
 use arc_swap::ArcSwap;
+use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
 /// Holds the current rustls ServerConfig behind ArcSwap for lock-free reload
@@ -17,6 +17,7 @@ pub struct TlsState {
 }
 
 impl TlsState {
+    #[allow(dead_code)]
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config: Arc::new(ArcSwap::from_pointee(config)),
@@ -66,19 +67,29 @@ impl TlsState {
         self.config.store(Arc::new(new_config));
     }
 
-    pub fn reload_from_pem(&self, cert_path: &Path, key_path: &Path) -> Result<(), crate::tls::TlsError> {
+    pub fn reload_from_pem(
+        &self,
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> Result<(), crate::tls::TlsError> {
         let new_cfg = crate::tls::config::build_single_config(cert_path, key_path)?;
         self.reload(new_cfg);
-        eprintln!("INFO rustwasgi: certificate reload: new config from {} {}", cert_path.display(), key_path.display());
+        eprintln!(
+            "INFO rustwasgi: certificate reload: new config from {} {}",
+            cert_path.display(),
+            key_path.display()
+        );
         Ok(())
     }
 }
 
 /// Helper for atomic cert install - writes to temp then rename
+#[allow(dead_code)]
 pub struct TlsReloader {
     pub state: Arc<TlsState>,
 }
 
+#[allow(dead_code)]
 impl TlsReloader {
     pub fn new(state: Arc<TlsState>) -> Self {
         Self { state }

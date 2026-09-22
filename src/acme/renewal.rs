@@ -19,8 +19,15 @@ impl AcmeConfig {
         if cfg.acme_domains.is_empty() || cfg.acme_email.is_none() {
             return None;
         }
-        let dir = cfg.acme_directory.clone().unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
-        let storage = cfg.acme_dir.clone().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("./acme"));
+        let dir = cfg
+            .acme_directory
+            .clone()
+            .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
+        let storage = cfg
+            .acme_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("./acme"));
         Some(Self {
             directory_url: dir,
             email: cfg.acme_email.clone().unwrap(),
@@ -40,7 +47,8 @@ pub fn should_renew(cert_path: &Path, threshold_days: u64) -> Result<bool, Strin
         .map_err(|e| format!("parse cert: {e}"))?;
     let first = certs.first().ok_or("no cert")?;
     use x509_parser::prelude::*;
-    let (_, cert) = X509Certificate::from_der(first.as_ref()).map_err(|e| format!("x509 parse: {e}"))?;
+    let (_, cert) =
+        X509Certificate::from_der(first.as_ref()).map_err(|e| format!("x509 parse: {e}"))?;
     let not_after = cert.validity().not_after;
     // Use x509-parser's OffsetDateTime to avoid time crate version mismatch
     let expiry_secs = not_after.to_datetime().unix_timestamp();
@@ -56,10 +64,13 @@ pub fn should_renew(cert_path: &Path, threshold_days: u64) -> Result<bool, Strin
 /// Generate self-signed cert for domains (mock ACME issuance for tests and fallback)
 pub fn generate_self_signed(domains: &[String]) -> Result<(Vec<u8>, Vec<u8>), String> {
     use rcgen::{CertificateParams, DistinguishedName, KeyPair};
-    let mut params = CertificateParams::new(domains.to_vec()).map_err(|e| format!("params: {e}"))?;
+    let mut params =
+        CertificateParams::new(domains.to_vec()).map_err(|e| format!("params: {e}"))?;
     params.distinguished_name = DistinguishedName::new();
     let key_pair = KeyPair::generate().map_err(|e| format!("key gen: {e}"))?;
-    let cert = params.self_signed(&key_pair).map_err(|e| format!("self signed: {e}"))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| format!("self signed: {e}"))?;
     let cert_pem = cert.pem().into_bytes();
     let key_pem = key_pair.serialize_pem().into_bytes();
     Ok((cert_pem, key_pem))
@@ -75,15 +86,20 @@ pub fn renew_self_signed(
     let (cert_pem, key_pem) = generate_self_signed(domains)?;
     crate::acme::certificate::atomic_install(&cert_pem, &key_pem, cert_path, key_path, tls_state)?;
     crate::metrics::inc(crate::metrics::C_ACME_RENEWALS);
-    eprintln!("INFO rustwasgi: ACME self-signed renewal completed for {:?}", domains);
+    eprintln!(
+        "INFO rustwasgi: ACME self-signed renewal completed for {:?}",
+        domains
+    );
     Ok(())
 }
 
 /// Background renewal task
+#[allow(dead_code)]
 pub struct RenewalTask {
     shutdown_tx: watch::Sender<bool>,
 }
 
+#[allow(dead_code)]
 impl RenewalTask {
     pub fn spawn(
         config: AcmeConfig,
@@ -114,20 +130,35 @@ impl RenewalTask {
                 if !needs {
                     continue;
                 }
-                eprintln!("INFO rustwasgi: ACME renewal triggered for {:?}", config.domains);
+                eprintln!(
+                    "INFO rustwasgi: ACME renewal triggered for {:?}",
+                    config.domains
+                );
                 crate::metrics::inc(crate::metrics::C_ACME_ORDERS);
                 // For now, use self-signed as stand-in for ACME order
                 // Real ACME would do: create account, place challenge, wait, finalize
                 // We simulate by generating self-signed and installing
                 // In production, replace with instant_acme order flow
-                let result = if config.directory_url.contains("mock") || config.directory_url.is_empty() {
+                let result = if config.directory_url.contains("mock")
+                    || config.directory_url.is_empty()
+                {
                     renew_self_signed(&config.domains, &tls_clone, &cert_path, &key_path)
                 } else {
                     // Try real ACME, fallback to self-signed on failure (never crash)
-                    match try_acme_issuance(&config, &tls_clone, &challenge_clone, &cert_path, &key_path).await {
+                    match try_acme_issuance(
+                        &config,
+                        &tls_clone,
+                        &challenge_clone,
+                        &cert_path,
+                        &key_path,
+                    )
+                    .await
+                    {
                         Ok(_) => Ok(()),
                         Err(e) => {
-                            eprintln!("WARN rustwasgi: ACME issuance failed: {e}, retaining current cert");
+                            eprintln!(
+                                "WARN rustwasgi: ACME issuance failed: {e}, retaining current cert"
+                            );
                             crate::metrics::inc(crate::metrics::C_ACME_RENEWAL_FAILURES);
                             Err(e)
                         }
@@ -157,19 +188,28 @@ async fn try_acme_issuance(
     // Load or create account
     // For brevity, use instant_acme with directory_url
     // This is a simplified flow that handles Http01 only
-    use instant_acme::{Account, Identifier, NewAccount, NewOrder, OrderStatus, ChallengeType};
+    use instant_acme::{ChallengeType, Identifier, NewOrder, OrderStatus};
     let account = crate::acme::account::load_or_create_account(
         &config.storage_dir,
         &config.email,
         &config.directory_url,
     )
     .await?;
-    let identifiers: Vec<Identifier> = config.domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
+    let identifiers: Vec<Identifier> = config
+        .domains
+        .iter()
+        .map(|d| Identifier::Dns(d.clone()))
+        .collect();
     let mut order = account
-        .new_order(&NewOrder { identifiers: &identifiers })
+        .new_order(&NewOrder {
+            identifiers: &identifiers,
+        })
         .await
         .map_err(|e| format!("new order: {e}"))?;
-    let authzs = order.authorizations().await.map_err(|e| format!("authz: {e}"))?;
+    let authzs = order
+        .authorizations()
+        .await
+        .map_err(|e| format!("authz: {e}"))?;
     for authz in &authzs {
         let challenge = authz
             .challenges
@@ -179,7 +219,10 @@ async fn try_acme_issuance(
         let key_auth = order.key_authorization(challenge);
         // Place challenge
         challenge_store.insert(challenge.token.clone(), key_auth.as_str().to_string());
-        eprintln!("INFO rustwasgi: ACME challenge installed for {}", challenge.token);
+        eprintln!(
+            "INFO rustwasgi: ACME challenge installed for {}",
+            challenge.token
+        );
         order
             .set_challenge_ready(&challenge.url)
             .await
@@ -211,7 +254,11 @@ async fn try_acme_issuance(
     crate::acme::certificate::atomic_install(&cert_pem, &key_pem, cert_path, key_path, tls_state)?;
     // Cleanup challenges
     for authz in &authzs {
-        if let Some(ch) = authz.challenges.iter().find(|c| c.r#type == ChallengeType::Http01) {
+        if let Some(ch) = authz
+            .challenges
+            .iter()
+            .find(|c| c.r#type == ChallengeType::Http01)
+        {
             challenge_store.remove(&ch.token);
         }
     }

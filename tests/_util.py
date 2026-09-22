@@ -97,6 +97,30 @@ class StdServer:
         self.port = port
         self.is_tls = any("--tls-cert" in str(x) for x in extra)
 
+    def request(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        conn.request(method, path, body=body or b"", headers=headers or {})
+        resp = conn.getresponse()
+        data = resp.read()
+        out = (resp.status, resp.getheaders(), data)
+        conn.close()
+        return out
+
+    def stop(self) -> str:
+        self.proc.terminate()
+        try:
+            out, _ = self.proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            out, _ = self.proc.communicate(timeout=10)
+        return out or ""
+
+    def stop_and_assert_clean(self) -> str:
+        out = self.stop()
+        assert self.proc.returncode is not None, "server still running after SIGTERM"
+        assert "Traceback" not in out, f"traceback in server output:\n{out}"
+        return out
+
 
 class TlsServer(StdServer):
     """Standalone TLS server (HTTPS)"""

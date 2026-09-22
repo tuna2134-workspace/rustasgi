@@ -34,6 +34,7 @@ impl ChallengeStore {
         eprintln!("INFO rustwasgi: ACME challenge removed");
     }
 
+    #[allow(dead_code)]
     pub fn clear(&self) {
         self.inner.write().unwrap().clear();
     }

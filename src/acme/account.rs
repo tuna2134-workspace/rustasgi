@@ -1,6 +1,6 @@
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,12 +23,16 @@ pub async fn load_or_create_account(
             .map_err(|e| format!("failed to read account file: {e}"))?;
         let acc_data: AccountData = serde_json::from_str(&data)
             .map_err(|e| format!("failed to parse account file: {e}"))?;
-        let creds: instant_acme::AccountCredentials = serde_json::from_str(&acc_data.credentials)
-            .map_err(|e| format!("failed to parse credentials: {e}"))?;
+        let creds: instant_acme::AccountCredentials =
+            serde_json::from_str(&acc_data.credentials)
+                .map_err(|e| format!("failed to parse credentials: {e}"))?;
         let account = instant_acme::Account::from_credentials(creds)
             .await
             .map_err(|e| format!("failed to restore account: {e}"))?;
-        eprintln!("INFO rustwasgi: ACME account loaded from {}", account_path.display());
+        eprintln!(
+            "INFO rustwasgi: ACME account loaded from {}",
+            account_path.display()
+        );
         return Ok(account);
     }
 
@@ -51,7 +55,8 @@ pub async fn load_or_create_account(
     {
         let _ = fs::set_permissions(acme_dir, fs::Permissions::from_mode(0o700));
     }
-    let cred_str = serde_json::to_string(&credentials).map_err(|e| format!("serialize creds: {e}"))?;
+    let cred_str =
+        serde_json::to_string(&credentials).map_err(|e| format!("serialize creds: {e}"))?;
     let data = AccountData {
         credentials: cred_str,
         email: email.to_string(),
@@ -65,10 +70,14 @@ pub async fn load_or_create_account(
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
     }
     fs::rename(&tmp, &account_path).map_err(|e| format!("rename account: {e}"))?;
-    eprintln!("INFO rustwasgi: ACME account created and saved to {}", account_path.display());
+    eprintln!(
+        "INFO rustwasgi: ACME account created and saved to {}",
+        account_path.display()
+    );
     Ok(account)
 }
 
+#[allow(dead_code)]
 pub fn account_storage_path(acme_dir: &Path) -> PathBuf {
     acme_dir.join("account.json")
 }

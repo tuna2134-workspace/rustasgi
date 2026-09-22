@@ -33,10 +33,12 @@ impl SniResolver {
         self.default = Some(Arc::new(ck));
     }
 
+    #[allow(dead_code)]
     pub fn into_inner(self) -> Self {
         self
     }
 
+    #[allow(dead_code)]
     pub fn into_reloadable(self, _has_default: bool) -> ReloadableResolver {
         ReloadableResolver::new(self)
     }
@@ -44,10 +46,10 @@ impl SniResolver {
 
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        if let Some(name) = client_hello.server_name() {
-            if let Some(ck) = self.by_name.get(&name.to_ascii_lowercase()) {
-                return Some(ck.clone());
-            }
+        if let Some(name) = client_hello.server_name()
+            && let Some(ck) = self.by_name.get(&name.to_ascii_lowercase())
+        {
+            return Some(ck.clone());
         }
         self.default.clone()
     }
@@ -55,10 +57,12 @@ impl ResolvesServerCert for SniResolver {
 
 /// Reloadable resolver wrapping ArcSwap for atomic reload without restart
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ReloadableResolver {
     inner: Arc<ArcSwap<SniResolver>>,
 }
 
+#[allow(dead_code)]
 impl ReloadableResolver {
     pub fn new(initial: SniResolver) -> Self {
         Self {

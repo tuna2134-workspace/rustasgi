@@ -72,17 +72,35 @@ fn run(
     let acme_domains = if acme_domains.is_empty() {
         std::env::var("RUSTWASGI_ACME_DOMAINS")
             .ok()
-            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         acme_domains
     };
-    let tls_cert = tls_cert.or_else(|| std::env::var("RUSTWASGI_TLS_CERT").ok().filter(|s| !s.is_empty()));
-    let tls_key = tls_key.or_else(|| std::env::var("RUSTWASGI_TLS_KEY").ok().filter(|s| !s.is_empty()));
+    let tls_cert = tls_cert.or_else(|| {
+        std::env::var("RUSTWASGI_TLS_CERT")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    let tls_key = tls_key.or_else(|| {
+        std::env::var("RUSTWASGI_TLS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     let tls_sni = if tls_sni.is_empty() {
         std::env::var("RUSTWASGI_TLS_SNI")
             .ok()
-            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         tls_sni
@@ -98,7 +116,8 @@ fn run(
         access_log,
         tls_cert,
         tls_key,
-        redirect_http_to_https || std::env::var("RUSTWASGI_REDIRECT_HTTP_TO_HTTPS").as_deref() == Ok("1"),
+        redirect_http_to_https
+            || std::env::var("RUSTWASGI_REDIRECT_HTTP_TO_HTTPS").as_deref() == Ok("1"),
         acme_directory.or_else(|| std::env::var("RUSTWASGI_ACME_DIRECTORY").ok()),
         acme_email.or_else(|| std::env::var("RUSTWASGI_ACME_EMAIL").ok()),
         acme_domains,
@@ -200,15 +219,35 @@ fn run_worker(
     let acme_domains = if acme_domains.is_empty() {
         std::env::var("RUSTWASGI_ACME_DOMAINS")
             .ok()
-            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
             .unwrap_or_default()
-    } else { acme_domains };
-    let tls_cert = tls_cert.or_else(|| std::env::var("RUSTWASGI_TLS_CERT").ok().filter(|s| !s.is_empty()));
-    let tls_key = tls_key.or_else(|| std::env::var("RUSTWASGI_TLS_KEY").ok().filter(|s| !s.is_empty()));
+    } else {
+        acme_domains
+    };
+    let tls_cert = tls_cert.or_else(|| {
+        std::env::var("RUSTWASGI_TLS_CERT")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    let tls_key = tls_key.or_else(|| {
+        std::env::var("RUSTWASGI_TLS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     let tls_sni = if tls_sni.is_empty() {
         std::env::var("RUSTWASGI_TLS_SNI")
             .ok()
-            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         tls_sni
@@ -224,7 +263,8 @@ fn run_worker(
         access_log,
         tls_cert,
         tls_key,
-        redirect_http_to_https || std::env::var("RUSTWASGI_REDIRECT_HTTP_TO_HTTPS").as_deref() == Ok("1"),
+        redirect_http_to_https
+            || std::env::var("RUSTWASGI_REDIRECT_HTTP_TO_HTTPS").as_deref() == Ok("1"),
         acme_directory.or_else(|| std::env::var("RUSTWASGI_ACME_DIRECTORY").ok()),
         acme_email.or_else(|| std::env::var("RUSTWASGI_ACME_EMAIL").ok()),
         acme_domains,
@@ -358,7 +398,7 @@ fn serve_process_on(
             _ => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
                     "both --tls-cert and --tls-key must be provided for default cert when using SNI",
-                ))
+                ));
             }
         };
         match crate::tls::TlsState::from_sni_entries(&entries, default) {
@@ -369,11 +409,14 @@ fn serve_process_on(
             Err(e) => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "failed to load SNI certs: {e}"
-                )))
+                )));
             }
         }
     } else if let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) {
-        match crate::tls::TlsState::from_pem_files(std::path::Path::new(cert), std::path::Path::new(key)) {
+        match crate::tls::TlsState::from_pem_files(
+            std::path::Path::new(cert),
+            std::path::Path::new(key),
+        ) {
             Ok(s) => {
                 eprintln!("INFO rustwasgi: TLS enabled cert={cert} key={key}");
                 Some(std::sync::Arc::new(s))
@@ -381,7 +424,7 @@ fn serve_process_on(
             Err(e) => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "failed to load TLS cert/key: {e}"
-                )))
+                )));
             }
         }
     } else if config.tls_cert.is_some() || config.tls_key.is_some() {
@@ -421,7 +464,9 @@ fn serve_process_on(
                 crate::acme::renewal::AcmeConfig::from_server_config(config)
             {
                 if tls_state.is_none() {
-                    eprintln!("WARN rustwasgi: ACME enabled but TLS not configured; ACME renewal disabled");
+                    eprintln!(
+                        "WARN rustwasgi: ACME enabled but TLS not configured; ACME renewal disabled"
+                    );
                     None
                 } else {
                     let acme_tls = tls_state.clone().unwrap();

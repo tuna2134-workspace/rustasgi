@@ -252,14 +252,15 @@ pub async fn serve(
     }
 
     // Certificate file watcher (atomic reload without restart)
-    if let Some(tls) = state.tls_state.clone() {
-        if tls.cert_path.is_some() && tls.key_path.is_some() {
-            let tls_clone = tls.clone();
-            let shutdown_clone = shutdown.clone();
-            tokio::spawn(async move {
-                cert_watcher(tls_clone, shutdown_clone).await;
-            });
-        }
+    if let Some(tls) = state.tls_state.clone()
+        && tls.cert_path.is_some()
+        && tls.key_path.is_some()
+    {
+        let tls_clone = tls.clone();
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            cert_watcher(tls_clone, shutdown_clone).await;
+        });
     }
 
     // One accept task per listener (TCP + Unix alike).
@@ -325,7 +326,10 @@ pub async fn serve(
                                 }
                                 Err(e) => {
                                     crate::metrics::inc_tls_handshake_error();
-                                    eprintln!("WARN rustwasgi: TLS handshake failed from {}: {}", client, e);
+                                    eprintln!(
+                                        "WARN rustwasgi: TLS handshake failed from {}: {}",
+                                        client, e
+                                    );
                                     continue;
                                 }
                             }
@@ -472,8 +476,17 @@ async fn spawn_connection<I>(
                 // The guard lives until the response body (or WS driver)
                 // finishes: handle_request moves it into the background pump.
                 let guard = crate::runtime::FlightGuard::new(&in_flight);
-                let resp =
-                    handle_request(req, &state, &ch, client_port, &sh, server_port, is_tls, guard).await;
+                let resp = handle_request(
+                    req,
+                    &state,
+                    &ch,
+                    client_port,
+                    &sh,
+                    server_port,
+                    is_tls,
+                    guard,
+                )
+                .await;
                 // max_requests recycling: once the quota is hit, stop
                 // accepting so the worker can exit and be replaced.
                 let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
@@ -618,7 +631,9 @@ async fn cert_watcher(tls: std::sync::Arc<crate::tls::TlsState>, shutdown: Arc<S
         if shutdown.is_set() {
             break;
         }
-        let cert_mtime = std::fs::metadata(&cert_path).and_then(|m| m.modified()).ok();
+        let cert_mtime = std::fs::metadata(&cert_path)
+            .and_then(|m| m.modified())
+            .ok();
         let key_mtime = std::fs::metadata(&key_path).and_then(|m| m.modified()).ok();
         let changed = cert_mtime != last_cert_mtime || key_mtime != last_key_mtime;
         if changed && cert_mtime.is_some() && key_mtime.is_some() {
@@ -719,7 +734,11 @@ async fn handle_websocket_upgrade(
         raw_path: path_raw.as_bytes().to_vec(),
         query_string: uri.query().unwrap_or("").as_bytes().to_vec(),
         headers,
-        scheme: if is_tls { "wss".to_string() } else { "ws".to_string() },
+        scheme: if is_tls {
+            "wss".to_string()
+        } else {
+            "ws".to_string()
+        },
         http_version: version_str,
     };
     let on_upgrade = hyper::upgrade::on(req);
@@ -814,18 +833,17 @@ async fn handle_http(
 
     // ACME HTTP-01 challenge: serve without Python (RFC 8555)
     // Path must be exactly /.well-known/acme-challenge/<token> with strict token validation
-    if path_raw.starts_with("/.well-known/acme-challenge/") {
-        let token = &path_raw["/.well-known/acme-challenge/".len()..];
-        if crate::tls::is_valid_token(token) {
-            if let Some(auth) = state.challenge_store.get(token) {
-                crate::metrics::inc_acme_challenge_hit();
-                return Response::builder()
-                    .status(200)
-                    .header(http::header::CONTENT_TYPE, "text/plain")
-                    .header(http::header::CONTENT_LENGTH, auth.len().to_string())
-                    .body(full_body(auth.into_bytes()))
-                    .unwrap();
-            }
+    if let Some(token) = path_raw.strip_prefix("/.well-known/acme-challenge/") {
+        if crate::tls::is_valid_token(token)
+            && let Some(auth) = state.challenge_store.get(token)
+        {
+            crate::metrics::inc_acme_challenge_hit();
+            return Response::builder()
+                .status(200)
+                .header(http::header::CONTENT_TYPE, "text/plain")
+                .header(http::header::CONTENT_LENGTH, auth.len().to_string())
+                .body(full_body(auth.into_bytes()))
+                .unwrap();
         }
         // Invalid token or not found: 404 (don't leak store)
         return status_response(404, "Not Found");
@@ -839,7 +857,7 @@ async fn handle_http(
             .and_then(|v| v.to_str().ok())
             .unwrap_or(server_host);
         // Strip CRLF to prevent header injection
-        let host = host.split(|c| c == '\r' || c == '\n').next().unwrap_or(server_host);
+        let host = host.split(['\r', '\n']).next().unwrap_or(server_host);
         // Host must not be empty and must not contain spaces
         if host.is_empty() || host.contains(' ') {
             return status_response(400, "Bad Request");
