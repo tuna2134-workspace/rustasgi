@@ -589,6 +589,56 @@ async fn heartbeat_loop(state: Arc<AppState>, shutdown: Arc<Shutdown>) {
     }
 }
 
+async fn cert_watcher(tls: std::sync::Arc<crate::tls::TlsState>, shutdown: Arc<Shutdown>) {
+    use std::time::Duration;
+    let cert_path = match &tls.cert_path {
+        Some(p) => p.clone(),
+        None => return,
+    };
+    let key_path = match &tls.key_path {
+        Some(p) => p.clone(),
+        None => return,
+    };
+    let mut last_cert_mtime: Option<std::time::SystemTime> = None;
+    let mut last_key_mtime: Option<std::time::SystemTime> = None;
+    // Initialize with current mtime
+    if let Ok(meta) = std::fs::metadata(&cert_path) {
+        last_cert_mtime = meta.modified().ok();
+    }
+    if let Ok(meta) = std::fs::metadata(&key_path) {
+        last_key_mtime = meta.modified().ok();
+    }
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {},
+            _ = shutdown.wait() => break,
+        }
+        if shutdown.is_set() {
+            break;
+        }
+        let cert_mtime = std::fs::metadata(&cert_path).and_then(|m| m.modified()).ok();
+        let key_mtime = std::fs::metadata(&key_path).and_then(|m| m.modified()).ok();
+        let changed = cert_mtime != last_cert_mtime || key_mtime != last_key_mtime;
+        if changed && cert_mtime.is_some() && key_mtime.is_some() {
+            // Small debounce: wait 500ms for atomic rename to complete (both files)
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match tls.reload_from_pem(&cert_path, &key_path) {
+                Ok(_) => {
+                    eprintln!("INFO rustwasgi: certificate reloaded via file watcher");
+                    last_cert_mtime = cert_mtime;
+                    last_key_mtime = key_mtime;
+                }
+                Err(e) => {
+                    eprintln!("WARN rustwasgi: certificate reload failed (keeping old): {e}");
+                    // Don't update mtime, will retry
+                }
+            }
+        }
+    }
+}
+
 /// Per-request dispatch: WebSocket upgrade vs. plain HTTP.
 ///
 /// The `guard` is moved into whichever background task owns the request's
