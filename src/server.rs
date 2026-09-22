@@ -251,6 +251,17 @@ pub async fn serve(
         });
     }
 
+    // Certificate file watcher (atomic reload without restart)
+    if let Some(tls) = state.tls_state.clone() {
+        if tls.cert_path.is_some() && tls.key_path.is_some() {
+            let tls_clone = tls.clone();
+            let shutdown_clone = shutdown.clone();
+            tokio::spawn(async move {
+                cert_watcher(tls_clone, shutdown_clone).await;
+            });
+        }
+    }
+
     // One accept task per listener (TCP + Unix alike).
     let mut acceptors: JoinSet<()> = JoinSet::new();
     for listener in listeners {

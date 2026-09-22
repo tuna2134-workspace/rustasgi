@@ -11,6 +11,9 @@ pub struct TlsState {
     pub config: Arc<ArcSwap<ServerConfig>>,
     /// Number of certs for logging (SNI map size or 1)
     cert_count: usize,
+    /// Stored paths for file-watcher reload (single cert case)
+    pub cert_path: Option<std::path::PathBuf>,
+    pub key_path: Option<std::path::PathBuf>,
 }
 
 impl TlsState {
@@ -18,12 +21,19 @@ impl TlsState {
         Self {
             config: Arc::new(ArcSwap::from_pointee(config)),
             cert_count: 1,
+            cert_path: None,
+            key_path: None,
         }
     }
 
     pub fn from_pem_files(cert_path: &Path, key_path: &Path) -> Result<Self, crate::tls::TlsError> {
         let cfg = crate::tls::config::build_single_config(cert_path, key_path)?;
-        Ok(Self::new(cfg))
+        Ok(Self {
+            config: Arc::new(ArcSwap::from_pointee(cfg)),
+            cert_count: 1,
+            cert_path: Some(cert_path.to_path_buf()),
+            key_path: Some(key_path.to_path_buf()),
+        })
     }
 
     pub fn from_sni_entries(
