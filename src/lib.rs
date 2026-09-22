@@ -204,6 +204,14 @@ fn run_worker(
     } else { acme_domains };
     let tls_cert = tls_cert.or_else(|| std::env::var("RUSTWASGI_TLS_CERT").ok().filter(|s| !s.is_empty()));
     let tls_key = tls_key.or_else(|| std::env::var("RUSTWASGI_TLS_KEY").ok().filter(|s| !s.is_empty()));
+    let tls_sni = if tls_sni.is_empty() {
+        std::env::var("RUSTWASGI_TLS_SNI")
+            .ok()
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default()
+    } else {
+        tls_sni
+    };
     let config = ServerConfig::new(
         app_spec.to_string(),
         String::new(),
@@ -220,6 +228,7 @@ fn run_worker(
         acme_email.or_else(|| std::env::var("RUSTWASGI_ACME_EMAIL").ok()),
         acme_domains,
         acme_dir.or_else(|| std::env::var("RUSTWASGI_ACME_DIR").ok()),
+        tls_sni,
     );
     let app_obj = app.clone().unbind();
     let bridge = asgi::Bridge::install(py)?;
