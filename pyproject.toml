@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rustwasgi"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = []
+dynamic = ["version"]
+
+[project.optional-dependencies]
+test = ["fastapi>=0.100", "httpx>=0.24", "pytest>=7", "websockets>=12"]
+gunicorn = ["gunicorn>=20"]
+
+[project.scripts]
+rustwasgi = "rustwasgi.__main__:main"
+
+[tool.maturin]
+bindings = "pyo3"
+python-source = "python"
+module-name = "rustwasgi._rustwasgi"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

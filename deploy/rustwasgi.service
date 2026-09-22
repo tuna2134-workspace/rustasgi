@@ -1,0 +1,23 @@
+[Unit]
+Description=FastAPI via RustWASGI (Gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=app
+Group=app
+WorkingDirectory=/srv/app
+Environment="PATH=/srv/app/.venv/bin"
+ExecStart=/srv/app/.venv/bin/gunicorn \
+    --worker-class rustwasgi.gunicorn.RustWASGIWorker \
+    --workers 4 \
+    --bind unix:/run/myapp/app.sock \
+    --timeout 120 \
+    --graceful-timeout 30 \
+    --keep-alive 5 \
+    app:app
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
