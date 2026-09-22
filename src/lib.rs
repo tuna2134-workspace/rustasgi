@@ -354,8 +354,6 @@ fn serve_process_on(
     // Keep one loop reference for the post-serve stop.
     let loop_for_stop = loop_obj.clone_ref(py);
 
-    // ACME renewal task handle (lifecycle managed, outside GIL)
-    let acme_handle: Option<crate::acme::renewal::RenewalTask> = None;
     py.detach(|| {
         rt.block_on(async {
             // --- ACME setup (outside HTTP path, before serve) --------------

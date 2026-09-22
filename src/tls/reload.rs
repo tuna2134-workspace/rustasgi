@@ -45,6 +45,8 @@ impl TlsState {
         Ok(Self {
             config: Arc::new(ArcSwap::from_pointee(cfg)),
             cert_count: count,
+            cert_path: None,
+            key_path: None,
         })
     }
 
