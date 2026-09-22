@@ -37,8 +37,8 @@ pub const PHASE_NAMES: [&str; N_PHASES] = [
 ];
 
 // Counters: requests, tokio spawns, into_future calls, send fast/full,
-// GIL attaches (hot path), feeder chunks.
-pub const N_COUNTERS: usize = 12;
+// GIL attaches (hot path), feeder chunks, TLS, ACME.
+pub const N_COUNTERS: usize = 18;
 pub const C_REQUESTS: usize = 0;
 pub const C_SPAWNS: usize = 1;
 pub const C_INTO_FUTURE: usize = 2;
@@ -51,6 +51,12 @@ pub const C_APPDONE_PUMP: usize = 8;
 pub const C_APPDONE_NOWNOVER: usize = 9;
 pub const C_APPDONE_REAPER: usize = 10;
 pub const C_APPDONE_DEADLINE: usize = 11;
+pub const C_TLS_HANDSHAKES: usize = 12;
+pub const C_TLS_HANDSHAKE_ERRORS: usize = 13;
+pub const C_ACME_ORDERS: usize = 14;
+pub const C_ACME_RENEWALS: usize = 15;
+pub const C_ACME_RENEWAL_FAILURES: usize = 16;
+pub const C_ACME_CHALLENGE_HITS: usize = 17;
 
 pub const COUNTER_NAMES: [&str; N_COUNTERS] = [
     "requests",
@@ -65,6 +71,12 @@ pub const COUNTER_NAMES: [&str; N_COUNTERS] = [
     "appdone_now_or_never",
     "appdone_reaper",
     "appdone_deadline",
+    "tls_handshakes",
+    "tls_handshake_errors",
+    "acme_orders",
+    "acme_renewals",
+    "acme_renewal_failures",
+    "acme_challenge_hits",
 ];
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -97,7 +109,28 @@ static COUNTERS: [AtomicU64; N_COUNTERS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
+
+#[inline]
+pub fn inc_tls_handshake() {
+    inc(C_TLS_HANDSHAKES);
+}
+
+#[inline]
+pub fn inc_tls_handshake_error() {
+    inc(C_TLS_HANDSHAKE_ERRORS);
+}
+
+#[inline]
+pub fn inc_acme_challenge_hit() {
+    inc(C_ACME_CHALLENGE_HITS);
+}
 
 /// True when `RUSTWASGI_PROFILE=1` (report enabled).
 #[inline]

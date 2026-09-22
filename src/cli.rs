@@ -25,6 +25,20 @@ pub struct ServerConfig {
     /// Emit per-request access lines to stderr (standalone only; under
     /// Gunicorn the `access` hook feeds Gunicorn's access log instead).
     pub access_log: bool,
+    /// TLS certificate file (PEM)
+    pub tls_cert: Option<String>,
+    /// TLS private key file (PEM)
+    pub tls_key: Option<String>,
+    /// Redirect HTTP to HTTPS (301/308) except ACME challenges
+    pub redirect_http_to_https: bool,
+    /// ACME directory URL (e.g. Let's Encrypt)
+    pub acme_directory: Option<String>,
+    /// ACME contact email
+    pub acme_email: Option<String>,
+    /// ACME domains (SAN list)
+    pub acme_domains: Vec<String>,
+    /// ACME storage directory
+    pub acme_dir: Option<String>,
 }
 
 impl ServerConfig {
@@ -38,6 +52,13 @@ impl ServerConfig {
         root_path: String,
         lifespan: String,
         access_log: bool,
+        tls_cert: Option<String>,
+        tls_key: Option<String>,
+        redirect_http_to_https: bool,
+        acme_directory: Option<String>,
+        acme_email: Option<String>,
+        acme_domains: Vec<String>,
+        acme_dir: Option<String>,
     ) -> Self {
         Self {
             app_spec,
@@ -48,7 +69,22 @@ impl ServerConfig {
             root_path,
             lifespan,
             access_log,
+            tls_cert,
+            tls_key,
+            redirect_http_to_https,
+            acme_directory,
+            acme_email,
+            acme_domains,
+            acme_dir,
         }
+    }
+
+    pub fn is_tls_enabled(&self) -> bool {
+        self.tls_cert.is_some() && self.tls_key.is_some()
+    }
+
+    pub fn is_acme_enabled(&self) -> bool {
+        !self.acme_domains.is_empty() && self.acme_email.is_some()
     }
 
     pub fn log_info(&self, msg: &str) {

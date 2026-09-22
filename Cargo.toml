@@ -1,6 +1,6 @@
 [package]
 name = "rustwasgi"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 readme = "README.md"
 
@@ -21,3 +21,14 @@ futures-util = "0.3"
 tokio-tungstenite = "0.26"
 tungstenite = "0.26"
 pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
+arc-swap = "1.7"
+rcgen = "0.13"
+x509-parser = "0.16"
+time = { version = "0.3", features = ["std", "parsing", "formatting"] }
+instant-acme = { version = "0.4" }
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

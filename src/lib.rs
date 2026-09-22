@@ -23,6 +23,7 @@
 //! `--preload` is safe: only the (user) application object may predate the
 //! fork; every runtime is born after it.
 
+mod acme;
 mod asgi;
 mod cli;
 mod lifespan;
@@ -30,6 +31,7 @@ mod metrics;
 mod runtime;
 mod server;
 mod socket;
+mod tls;
 mod ws;
 
 use std::time::Duration;
@@ -44,7 +46,7 @@ use crate::socket::{BoundListener, InheritedSocket};
 
 /// Run the standalone ASGI server (blocking until SIGINT/SIGTERM).
 #[pyfunction]
-#[pyo3(signature = (app, *, host="127.0.0.1", port=8000, workers=1, log_level="info", root_path="", lifespan="auto", access_log=false, keep_alive=0))]
+#[pyo3(signature = (app, *, host="127.0.0.1", port=8000, workers=1, log_level="info", root_path="", lifespan="auto", access_log=false, keep_alive=0, tls_cert=None, tls_key=None, redirect_http_to_https=false, acme_directory=None, acme_email=None, acme_domains=Vec::new(), acme_dir=None))]
 #[allow(clippy::too_many_arguments)]
 fn run(
     py: Python<'_>,
@@ -57,7 +59,25 @@ fn run(
     lifespan: &str,
     access_log: bool,
     keep_alive: u64,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    redirect_http_to_https: bool,
+    acme_directory: Option<String>,
+    acme_email: Option<String>,
+    acme_domains: Vec<String>,
+    acme_dir: Option<String>,
 ) -> PyResult<()> {
+    // Env fallback for ACME domains if not passed (Gunicorn path may use env)
+    let acme_domains = if acme_domains.is_empty() {
+        std::env::var("RUSTWASGI_ACME_DOMAINS")
+            .ok()
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default()
+    } else {
+        acme_domains
+    };
+    let tls_cert = tls_cert.or_else(|| std::env::var("RUSTWASGI_TLS_CERT").ok().filter(|s| !s.is_empty()));
+    let tls_key = tls_key.or_else(|| std::env::var("RUSTWASGI_TLS_KEY").ok().filter(|s| !s.is_empty()));
     let config = ServerConfig::new(
         app.clone(),
         host.to_string(),
@@ -67,6 +87,13 @@ fn run(
         root_path.to_string(),
         lifespan.to_string(),
         access_log,
+        tls_cert,
+        tls_key,
+        redirect_http_to_https || std::env::var("RUSTWASGI_REDIRECT_HTTP_TO_HTTPS").as_deref() == Ok("1"),
+        acme_directory.or_else(|| std::env::var("RUSTWASGI_ACME_DIRECTORY").ok()),
+        acme_email.or_else(|| std::env::var("RUSTWASGI_ACME_EMAIL").ok()),
+        acme_domains,
+        acme_dir.or_else(|| std::env::var("RUSTWASGI_ACME_DIR").ok()),
     );
     if workers > 1 {
         config.log_warn(&format!(
@@ -128,7 +155,7 @@ fn run(
 /// `family` is `"tcp4"`, `"tcp6"` or `"unix"`. `notify`/`is_alive` wire the
 /// Gunicorn heartbeat; `access` receives access-log tuples (or `None`).
 #[pyfunction]
-#[pyo3(signature = (app, listeners, *, app_spec="gunicorn", root_path="", lifespan="auto", max_requests=0, graceful_timeout=30, heartbeat_interval=1, access_log=false, keep_alive=0, notify, is_alive, access=None))]
+#[pyo3(signature = (app, listeners, *, app_spec="gunicorn", root_path="", lifespan="auto", max_requests=0, graceful_timeout=30, heartbeat_interval=1, access_log=false, keep_alive=0, tls_cert=None, tls_key=None, redirect_http_to_https=false, acme_directory=None, acme_email=None, acme_domains=Vec::new(), acme_dir=None, notify, is_alive, access=None))]
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     py: Python<'_>,
@@ -142,6 +169,13 @@ fn run_worker(
     heartbeat_interval: u64,
     access_log: bool,
     keep_alive: u64,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    redirect_http_to_https: bool,
+    acme_directory: Option<String>,
+    acme_email: Option<String>,
+    acme_domains: Vec<String>,
+    acme_dir: Option<String>,
     notify: Py<PyAny>,
     is_alive: Py<PyAny>,
     access: Option<Py<PyAny>>,
@@ -152,6 +186,14 @@ fn run_worker(
         inherited.push(unsafe { InheritedSocket::from_raw(family, fd, description) });
     }
 
+    let acme_domains = if acme_domains.is_empty() {
+        std::env::var("RUSTWASGI_ACME_DOMAINS")
+            .ok()
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default()
+    } else { acme_domains };
+    let tls_cert = tls_cert.or_else(|| std::env::var("RUSTWASGI_TLS_CERT").ok().filter(|s| !s.is_empty()));
+    let tls_key = tls_key.or_else(|| std::env::var("RUSTWASGI_TLS_KEY").ok().filter(|s| !s.is_empty()));
     let config = ServerConfig::new(
         app_spec.to_string(),
         String::new(),
@@ -161,6 +203,13 @@ fn run_worker(
         root_path.to_string(),
         lifespan.to_string(),
         access_log,
+        tls_cert,
+        tls_key,
+        redirect_http_to_https || std::env::var("RUSTWASGI_REDIRECT_HTTP_TO_HTTPS").as_deref() == Ok("1"),
+        acme_directory.or_else(|| std::env::var("RUSTWASGI_ACME_DIRECTORY").ok()),
+        acme_email.or_else(|| std::env::var("RUSTWASGI_ACME_EMAIL").ok()),
+        acme_domains,
+        acme_dir.or_else(|| std::env::var("RUSTWASGI_ACME_DIR").ok()),
     );
     let app_obj = app.clone().unbind();
     let bridge = asgi::Bridge::install(py)?;
@@ -262,6 +311,34 @@ fn serve_process_on(
         locals,
         join_handle,
     } = loop_handle;
+    // TLS setup — outside HTTP path, validated at startup
+    let tls_state = if let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) {
+        match crate::tls::TlsState::from_pem_files(std::path::Path::new(cert), std::path::Path::new(key)) {
+            Ok(s) => {
+                eprintln!("INFO rustwasgi: TLS enabled cert={cert} key={key}");
+                Some(std::sync::Arc::new(s))
+            }
+            Err(e) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to load TLS cert/key: {e}"
+                )))
+            }
+        }
+    } else if config.tls_cert.is_some() || config.tls_key.is_some() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "both --tls-cert and --tls-key must be provided",
+        ));
+    } else {
+        None
+    };
+    let challenge_store = crate::tls::ChallengeStore::new();
+    // Log ACME config if present (ACME manager will be started inside serve)
+    if config.is_acme_enabled() {
+        eprintln!(
+            "INFO rustwasgi: ACME enabled domains={:?} dir={:?}",
+            config.acme_domains, config.acme_dir
+        );
+    }
     let serve_config = ServeConfig {
         app_spec,
         root_path: config.root_path.clone(),
@@ -270,12 +347,39 @@ fn serve_process_on(
         heartbeat_interval: Duration::from_secs(heartbeat_interval.max(1)),
         access_log: config.access_log,
         keep_alive_secs: keep_alive,
+        tls_state: tls_state.clone(),
+        challenge_store: challenge_store.clone(),
+        redirect_http_to_https: config.redirect_http_to_https,
     };
     // Keep one loop reference for the post-serve stop.
     let loop_for_stop = loop_obj.clone_ref(py);
 
+    // ACME renewal task handle (lifecycle managed, outside GIL)
+    let acme_handle: Option<crate::acme::renewal::RenewalTask> = None;
     py.detach(|| {
         rt.block_on(async {
+            // --- ACME setup (outside HTTP path, before serve) --------------
+            let _acme_task = if let Some(acme_cfg) =
+                crate::acme::renewal::AcmeConfig::from_server_config(config)
+            {
+                if tls_state.is_none() {
+                    eprintln!("WARN rustwasgi: ACME enabled but TLS not configured; ACME renewal disabled");
+                    None
+                } else {
+                    let acme_tls = tls_state.clone().unwrap();
+                    eprintln!(
+                        "INFO rustwasgi: ACME renewal task starting for {:?}",
+                        acme_cfg.domains
+                    );
+                    Some(crate::acme::renewal::RenewalTask::spawn(
+                        acme_cfg,
+                        acme_tls,
+                        challenge_store.clone(),
+                    ))
+                }
+            } else {
+                None
+            };
             // --- lifespan startup (before accepting) ----------------------
             let mode = LifespanMode::parse(&config.lifespan);
             let lifespan_state = match mode {

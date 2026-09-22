@@ -53,6 +53,7 @@ use tokio::task::JoinSet;
 use crate::asgi::{self, Bridge, RequestData, ResponseEvent};
 use crate::asgi::{REQUEST_PUT_TIMEOUT, RESPONSE_CHANNEL_BOUND};
 use crate::socket::BoundListener;
+use crate::tls::{ChallengeStore, TlsState};
 use crate::ws;
 
 type RespBody = BoxBody<Bytes, hyper::Error>;
@@ -72,6 +73,26 @@ pub struct ServeConfig {
     /// Idle keep-alive header wait (0 = hyper default of 30s). Maps
     /// Gunicorn's `keepalive` setting.
     pub keep_alive_secs: u64,
+    pub tls_state: Option<std::sync::Arc<TlsState>>,
+    pub challenge_store: ChallengeStore,
+    pub redirect_http_to_https: bool,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            app_spec: String::new(),
+            root_path: String::new(),
+            max_requests: 0,
+            graceful_timeout: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(1),
+            access_log: false,
+            keep_alive_secs: 0,
+            tls_state: None,
+            challenge_store: ChallengeStore::new(),
+            redirect_http_to_https: false,
+        }
+    }
 }
 
 /// Callbacks into the Python (Gunicorn) worker. Invoked via brief
@@ -113,6 +134,8 @@ struct AppState {
     lifespan_state: Option<Py<PyAny>>,
     config: ServeConfig,
     hooks: WorkerHooks,
+    tls_state: Option<std::sync::Arc<TlsState>>,
+    challenge_store: ChallengeStore,
 }
 
 /// How shutdown was triggered.
@@ -183,6 +206,15 @@ pub async fn serve(
         std::process::id()
     );
 
+    // Log TLS status
+    if let Some(tls) = &config.tls_state {
+        eprintln!("INFO rustwasgi: TLS enabled ({} certs)", tls.cert_count());
+    }
+    if config.redirect_http_to_https {
+        eprintln!("INFO rustwasgi: HTTP->HTTPS redirect enabled (challenges exempt)");
+    }
+    let tls_state = config.tls_state.clone();
+    let challenge_store = config.challenge_store.clone();
     let state = Arc::new(AppState {
         app,
         bridge,
@@ -190,6 +222,8 @@ pub async fn serve(
         lifespan_state,
         config,
         hooks,
+        tls_state,
+        challenge_store,
     });
     let shutdown = Arc::new(Shutdown::new());
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -234,6 +268,8 @@ pub async fn serve(
                 } => {
                     let server_host = local.ip().to_string();
                     let server_port = local.port();
+                    // Clone TLS state once per listener task (Arc clone is cheap)
+                    let tls_state = state.tls_state.clone();
                     loop {
                         if shutdown.is_set() {
                             break;
@@ -254,20 +290,51 @@ pub async fn serve(
                         if let Err(e) = stream.set_nodelay(true) {
                             eprintln!("WARN rustwasgi: set_nodelay failed: {e}");
                         }
-                        let io = TokioIo::new(stream);
-                        spawn_connection(
-                            io,
-                            client.to_string(),
-                            client.port(),
-                            server_host.clone(),
-                            server_port,
-                            &state,
-                            &shutdown,
-                            &in_flight,
-                            &completed,
-                            &connections,
-                        )
-                        .await;
+                        if let Some(tls) = tls_state.as_ref() {
+                            // TLS handshake — outside the HTTP path
+                            let acceptor = tls.acceptor();
+                            match acceptor.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    crate::metrics::inc_tls_handshake();
+                                    let io = TokioIo::new(tls_stream);
+                                    spawn_connection(
+                                        io,
+                                        client.to_string(),
+                                        client.port(),
+                                        server_host.clone(),
+                                        server_port,
+                                        true,
+                                        &state,
+                                        &shutdown,
+                                        &in_flight,
+                                        &completed,
+                                        &connections,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    crate::metrics::inc_tls_handshake_error();
+                                    eprintln!("WARN rustwasgi: TLS handshake failed from {}: {}", client, e);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            let io = TokioIo::new(stream);
+                            spawn_connection(
+                                io,
+                                client.to_string(),
+                                client.port(),
+                                server_host.clone(),
+                                server_port,
+                                false,
+                                &state,
+                                &shutdown,
+                                &in_flight,
+                                &completed,
+                                &connections,
+                            )
+                            .await;
+                        }
                     }
                 }
                 #[cfg(unix)]
@@ -303,6 +370,7 @@ pub async fn serve(
                             client_port,
                             server_host.clone(),
                             0,
+                            false,
                             &state,
                             &shutdown,
                             &in_flight,
@@ -359,6 +427,7 @@ async fn spawn_connection<I>(
     client_port: u16,
     server_host: String,
     server_port: u16,
+    is_tls: bool,
     state: &Arc<AppState>,
     shutdown: &Arc<Shutdown>,
     in_flight: &Arc<AtomicUsize>,
@@ -372,6 +441,7 @@ async fn spawn_connection<I>(
     let in_flight = in_flight.clone();
     let completed = completed.clone();
     let keep_alive_secs = state.config.keep_alive_secs;
+    let is_tls_flag = is_tls;
     let task = async move {
         let service = service_fn(move |req: Request<Incoming>| {
             let state = state.clone();
@@ -379,6 +449,7 @@ async fn spawn_connection<I>(
             let in_flight = in_flight.clone();
             let completed = completed.clone();
             let (ch, sh) = (client_host.clone(), server_host.clone());
+            let is_tls = is_tls_flag;
             async move {
                 if shutdown.is_set() {
                     // Drain: refuse new work on old connections with 503.
@@ -391,7 +462,7 @@ async fn spawn_connection<I>(
                 // finishes: handle_request moves it into the background pump.
                 let guard = crate::runtime::FlightGuard::new(&in_flight);
                 let resp =
-                    handle_request(req, &state, &ch, client_port, &sh, server_port, guard).await;
+                    handle_request(req, &state, &ch, client_port, &sh, server_port, is_tls, guard).await;
                 // max_requests recycling: once the quota is hit, stop
                 // accepting so the worker can exit and be replaced.
                 let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
@@ -519,6 +590,7 @@ async fn handle_request(
     client_port: u16,
     server_host: &str,
     server_port: u16,
+    is_tls: bool,
     guard: crate::runtime::FlightGuard,
 ) -> Response<RespBody> {
     if ws::is_websocket_upgrade(&req) {
@@ -529,6 +601,7 @@ async fn handle_request(
             client_port,
             server_host,
             server_port,
+            is_tls,
             guard,
         )
         .await;
@@ -540,6 +613,7 @@ async fn handle_request(
         client_port,
         server_host,
         server_port,
+        is_tls,
         guard,
     )
     .await
@@ -553,6 +627,7 @@ async fn handle_websocket_upgrade(
     client_port: u16,
     server_host: &str,
     server_port: u16,
+    is_tls: bool,
     guard: crate::runtime::FlightGuard,
 ) -> Response<RespBody> {
     // Extract handshake data before hyper takes the request.
@@ -583,7 +658,7 @@ async fn handle_websocket_upgrade(
         raw_path: path_raw.as_bytes().to_vec(),
         query_string: uri.query().unwrap_or("").as_bytes().to_vec(),
         headers,
-        scheme: "ws".to_string(),
+        scheme: if is_tls { "wss".to_string() } else { "ws".to_string() },
         http_version: version_str,
     };
     let on_upgrade = hyper::upgrade::on(req);
@@ -634,6 +709,7 @@ async fn handle_http(
     client_port: u16,
     server_host: &str,
     server_port: u16,
+    is_tls: bool,
     guard: crate::runtime::FlightGuard,
 ) -> Response<RespBody> {
     crate::metrics::inc(crate::metrics::C_REQUESTS);
@@ -674,10 +750,61 @@ async fn handle_http(
             }
         }
     }
+
+    // ACME HTTP-01 challenge: serve without Python (RFC 8555)
+    // Path must be exactly /.well-known/acme-challenge/<token> with strict token validation
+    if path_raw.starts_with("/.well-known/acme-challenge/") {
+        let token = &path_raw["/.well-known/acme-challenge/".len()..];
+        if crate::tls::is_valid_token(token) {
+            if let Some(auth) = state.challenge_store.get(token) {
+                crate::metrics::inc_acme_challenge_hit();
+                return Response::builder()
+                    .status(200)
+                    .header(http::header::CONTENT_TYPE, "text/plain")
+                    .header(http::header::CONTENT_LENGTH, auth.len().to_string())
+                    .body(full_body(auth.into_bytes()))
+                    .unwrap();
+            }
+        }
+        // Invalid token or not found: 404 (don't leak store)
+        return status_response(404, "Not Found");
+    }
+
+    // HTTPS redirect (except challenges, which already returned)
+    if state.config.redirect_http_to_https && !is_tls {
+        let host = parts
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(server_host);
+        // Strip CRLF to prevent header injection
+        let host = host.split(|c| c == '\r' || c == '\n').next().unwrap_or(server_host);
+        // Host must not be empty and must not contain spaces
+        if host.is_empty() || host.contains(' ') {
+            return status_response(400, "Bad Request");
+        }
+        let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+        let location = format!("https://{host}{}{query}", path_raw);
+        if location.contains('\r') || location.contains('\n') {
+            return status_response(400, "Bad Request");
+        }
+        return Response::builder()
+            .status(StatusCode::PERMANENT_REDIRECT)
+            .header(http::header::LOCATION, location)
+            .header(http::header::CONTENT_LENGTH, "0")
+            .body(empty_body())
+            .unwrap();
+    }
+
+    let scheme = if is_tls {
+        "https".to_string()
+    } else {
+        uri.scheme_str().unwrap_or("http").to_string()
+    };
     let data = RequestData {
         method: method.clone(),
         http_version: version_str,
-        scheme: uri.scheme_str().unwrap_or("http").to_string(),
+        scheme,
         path: asgi::percent_decode(&path_raw),
         raw_path: path_raw.as_bytes().to_vec(),
         query_string: uri.query().unwrap_or("").as_bytes().to_vec(),
