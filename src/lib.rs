@@ -26,6 +26,7 @@
 mod asgi;
 mod cli;
 mod lifespan;
+mod metrics;
 mod runtime;
 mod server;
 mod socket;
@@ -84,6 +85,7 @@ fn run(
     // the same runtime that serves them (Tokio I/O is runtime-bound).
     let rt_owned = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(tokio_worker_threads())
         .thread_name("rustwasgi-worker")
         .build()
         .map_err(|e| {
@@ -164,6 +166,7 @@ fn run_worker(
     // Tokio listeners *inside* its context (Tokio I/O is runtime-bound).
     let rt_owned = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(tokio_worker_threads())
         .thread_name("rustwasgi-worker")
         .build()
         .map_err(|e| {
@@ -195,6 +198,24 @@ fn run_worker(
         keep_alive,
     )?;
     Ok(())
+}
+
+/// Tokio worker thread count for this worker process.
+///
+/// `RUSTWASGI_THREADS` overrides; otherwise one thread per CPU. Under
+/// Gunicorn with W workers on C cores, W*C Tokio threads oversubscribe the
+/// machine — set e.g. `RUSTWASGI_THREADS=2` so total threads ≈ cores.
+/// Gunicorn may also pass an explicit per-worker count in future.
+fn tokio_worker_threads() -> usize {
+    if let Ok(v) = std::env::var("RUSTWASGI_THREADS")
+        && let Ok(n) = v.parse::<usize>()
+        && n >= 1
+    {
+        return n;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 /// Share our runtime with pyo3-async-runtimes so `future_into_py` send-waits

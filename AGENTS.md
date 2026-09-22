@@ -11,7 +11,9 @@ Rust + PyO3 ASGI server (hyper/Tokio) deployed as a **Gunicorn custom worker**
   - Console scripts used by tests live in `.venv/bin/` (`gunicorn`, `pytest`).
 - Toolchain (verify with `rustc --version`): rustc ~1.97, `maturin 1.15.0` at
   `.venv/bin/maturin`, `pyo3 0.29.0`, `edition = "2024"`, hyper 1.x,
-  tokio-tungstenite 0.26. No `wrk`/`hey`/`ab`; benchmarks use `/tmp/simple_bench.py`.
+  tokio-tungstenite 0.26. No `wrk`/`hey`/`ab`/`perf`/`pidstat`/`strace`;
+  benchmarks use `bench/bench.py`, profiling uses `/proc` task stats +
+  `RUSTWASGI_PROFILE=1` (see `src/metrics.rs`).
 
 ## Build / verify (order matters)
 
@@ -37,11 +39,16 @@ Rust + PyO3 ASGI server (hyper/Tokio) deployed as a **Gunicorn custom worker**
 - `examples/`: FastAPI/WS/lifespan/pure-ASGI/ASGI2/factory apps for tests.
 - `.venv/` and `/target` are gitignored; never commit them or `*.so`.
 
-## Hard-earned gotchas
+## Hard-earned gotchas (perf work added more — profile before optimizing)
 
-- GIL discipline: never `join()` the asyncio loop thread (or block on a
-  channel `recv`) while holding the GIL — release via `py.detach(...)`.
-  Same for `rx.recv()` on the loop-startup channel (pass ownership with `move`).
+- Perf workflow: `bench/bench.py` (JSON + medians) → per-thread `/proc` CPU
+  → `RUSTWASGI_PROFILE=1` phase table → change ONE thing → re-bench. Past
+  wins: `TCP_NODELAY` on accept (42ms floor), merging 6 GIL attaches into 1
+  (+40% RPS), RAII drain guard (IncompleteRead). Past non-issues: accept
+  skew without `--reuse-port` (environmental), single-loader caps above
+  ~3500 rps (use parallel loader processes), `RUSTWASGI_THREADS` 2≈8 here.
+- `/proc/PID/status` switch counters can be stale in containers; sum
+  `/proc/PID/task/*/status` instead. No ptrace here (py-spy/gdb attach fail).
 - `loop.call_soon_threadsafe(put, msg)` — pass `(put, msg)`, NOT `(put, (msg,))`
   (PyO3 turns the Rust 1-tuple into a Python tuple and the app gets garbage).
   (Legacy note: direct threadsafe calls are gone from the request path;

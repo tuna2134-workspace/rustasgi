@@ -50,7 +50,7 @@ use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
 use tokio::task::JoinSet;
 
-use crate::asgi::{self, Bridge, RequestData, ResponseEvent, SendSink};
+use crate::asgi::{self, Bridge, RequestData, ResponseEvent};
 use crate::asgi::{REQUEST_PUT_TIMEOUT, RESPONSE_CHANNEL_BOUND};
 use crate::socket::BoundListener;
 use crate::ws;
@@ -341,6 +341,9 @@ pub async fn serve(
             eprintln!("INFO rustwasgi: shutdown complete");
         }
     }
+    if crate::metrics::enabled() {
+        eprintln!("{}", crate::metrics::report());
+    }
     // Abort leftover (idle keep-alive) connections, release the watcher.
     connections.lock().await.abort_all();
     while connections.lock().await.join_next().await.is_some() {}
@@ -630,6 +633,8 @@ async fn handle_http(
     server_port: u16,
     guard: crate::runtime::FlightGuard,
 ) -> Response<RespBody> {
+    crate::metrics::inc(crate::metrics::C_REQUESTS);
+    let t_total = crate::metrics::now();
     let started_at = Instant::now();
     let (parts, body) = req.into_parts();
     let method = parts.method.as_str().to_string();
@@ -684,34 +689,23 @@ async fn handle_http(
     let path_for_log = data.path.clone();
     let query_for_log = String::from_utf8_lossy(&data.query_string).into_owned();
 
-    // Response channel + sink; the app task is established with pure async
-    // awaits (GIL only for microsecond-scale construction).
+    // Response channel; the app task is established with pure async
+    // awaits (one GIL acquisition for all construction — see establish).
     let disconnected = Arc::new(AtomicBool::new(false));
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ResponseEvent>(RESPONSE_CHANNEL_BOUND);
-    let sink = match Python::attach(|py| {
-        SendSink::new(tx, disconnected.clone(), state.locals.clone())
-            .into_pyobject(py)
-            .map(|b| b.unbind())
-    }) {
-        Ok(s) => s,
-        Err(e) => {
-            Python::attach(|py| e.print(py));
-            return status_response(500, "Internal Server Error");
-        }
-    };
-    let app_c = Python::attach(|py| state.app.clone_ref(py));
-    let st_c = Python::attach(|py| crate::runtime::clone_opt_py(py, &state.lifespan_state));
     let established = asgi::establish_http_call(
         &state.bridge,
         &state.locals,
-        &app_c,
-        st_c.as_ref(),
+        &state.app,
+        state.lifespan_state.as_ref(),
         &data,
-        sink,
+        tx,
+        disconnected.clone(),
     )
     .await;
-    let (queue, app_fut) = match established {
-        Ok(call) => (call.queue, call.app_fut),
+    crate::metrics::phase(crate::metrics::P_ESTABLISH, t_total);
+    let (queue_c, queue_f, app_fut) = match established {
+        Ok(call) => (call.queue_c, call.queue_f, call.app_fut),
         Err(e) => {
             eprintln!("ERROR rustwasgi: {e}");
             log_access(
@@ -728,15 +722,16 @@ async fn handle_http(
             return status_response(500, "Internal Server Error");
         }
     };
-    let queue_c = Python::attach(|py| queue.clone_ref(py));
-    let queue_f = Python::attach(|py| queue.clone_ref(py));
 
     // App reaper: awaits completion directly (traceback preserved in PyErr),
     // then releases the feeder. No monitor thread.
     let (app_done_tx, app_done_rx) = tokio::sync::watch::channel(false);
     {
+        crate::metrics::inc(crate::metrics::C_SPAWNS);
         tokio::spawn(async move {
+            let t_app = crate::metrics::now();
             let res = tokio::time::timeout(APP_COMPLETION_TIMEOUT, app_fut).await;
+            crate::metrics::phase(crate::metrics::P_APP_WAIT, t_app);
             match res {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
@@ -757,6 +752,7 @@ async fn handle_http(
     if has_body {
         let locals_c = state.locals.clone();
         let bridge_c = state.bridge.clone();
+        crate::metrics::inc(crate::metrics::C_SPAWNS);
         tokio::spawn(async move {
             feed_body(body, &bridge_c, &locals_c, &queue_f, app_done_rx).await;
         });
@@ -834,6 +830,8 @@ async fn handle_http(
         let disc = disconnected.clone();
         let client_label = client_host.to_string();
         let state_c = state_for_task(state);
+        crate::metrics::inc(crate::metrics::C_SPAWNS);
+        let t_pump = crate::metrics::now();
         tokio::spawn(async move {
             let mut sender = body_sender;
             let mut bytes_sent: u64 = 0;
@@ -874,9 +872,11 @@ async fn handle_http(
             )
             .await;
             // Full body delivered: release the drain guard.
+            crate::metrics::phase(crate::metrics::P_PUMP, t_pump);
             drop(guard);
         });
     }
+    crate::metrics::phase(crate::metrics::P_TOTAL, t_total);
     response
 }
 
@@ -925,6 +925,7 @@ async fn feed_body(
             Ok(data) if !data.is_empty() => data.to_vec(),
             _ => continue, // metadata frames: no trailer support, skip.
         };
+        crate::metrics::inc(crate::metrics::C_FEED_CHUNKS);
         // Ordered blocking-free put with backpressure; abort on app end.
         let put = async {
             asgi::feed_message(
@@ -987,6 +988,11 @@ async fn log_access(
     duration: Duration,
     client: &str,
 ) {
+    // Fast path: no hook and no stderr log means zero GIL interaction.
+    if state.hooks.access.is_none() && !state.config.access_log {
+        return;
+    }
+    crate::metrics::inc(crate::metrics::C_ATTACH);
     let hook = Python::attach(|py| crate::runtime::clone_opt_py(py, &state.hooks.access));
     let (method, path, query, client) = (
         method.to_string(),
@@ -1025,6 +1031,10 @@ async fn log_access_task(
     duration: Duration,
     client: &str,
 ) {
+    // Fast path: no hook and no stderr log means zero GIL interaction.
+    if state.hooks.access.is_none() && !state.access_log {
+        return;
+    }
     let hook = Python::attach(|py| crate::runtime::clone_opt_py(py, &state.hooks.access));
     let (method, path, query, client) = (
         method.to_string(),

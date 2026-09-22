@@ -114,7 +114,11 @@ post-fork in `run()`), `--worker-tmp-dir`, `--access-logfile`
 `--reload` (alive-flag driven).
 
 Extra worker knobs via environment: `RUSTWASGI_LIFESPAN=auto|on|off`,
-`RUSTWASGI_ROOT_PATH=/prefix`. TLS is **not** terminated by workers
+`RUSTWASGI_ROOT_PATH=/prefix`, `RUSTWASGI_THREADS=N` (Tokio workers per
+process; default CPU count — lower it to avoid oversubscription when running
+many workers, e.g. 2 with `-w 4` on 8 cores), `RUSTWASGI_PROFILE=1` (prints
+a request-path aggregate profile at shutdown; off by default).
+TLS is **not** terminated by workers
 (`is_ssl` raises with a clear error) — terminate at nginx/HAProxy/Caddy.
 
 ## Worker configuration
@@ -228,45 +232,62 @@ preload/lifespan/timeout-heartbeat/unix-socket, factories, ASGI 2.
 
 ## Benchmarking
 
-No wrk/hey/ab in this environment; method: threaded keep-alive loader
-(500-request warmup, then measured rounds), same FastAPI/pure-ASGI apps, same
-box (8 cores), **release** build (`maturin develop --release`).
+Reproducible harness: `bench/bench.py` (stdlib only; threaded keep-alive
+loader, warmup, N rounds with median, RPS/latency/CPU/RSS/context-switch/
+thread/fd accounting, JSON output). No wrk/hey/ab in this environment.
+Same app (`examples/bench_app.py`, `{"ok": true}`), same box (8 cores),
+**release** build (`maturin develop --release`).
 
-After the performance refactor (pyo3-async-runtimes bridge, zero-thread
-request path, bodyless fast path, `TCP_NODELAY`), single worker, `GET /`:
+Run: `.venv/bin/python bench/bench.py --servers standalone,uvicorn
+--levels 1,2,4,8,16,20,32,64,128,256 --rounds 3 --json out.json`
 
-| conc | rustwasgi rps | uvicorn rps | ratio | rustwasgi p50/p99 |
-|---|---|---|---|---|
-| 1 | 1281 | 1322 | **97%** | 0.7ms / 1.1ms |
-| 2 | 1655 | 1776 | **93%** | — |
-| 4 | 1913 | 1835 | **104%** | — |
-| 8 | 1892 | 1934 | **98%** | — |
-| 16 | 2191 | 2041 | **107%** | — |
-| 20 | 2030 | 1850 | **110%** | 9.5ms / 19.9ms |
-| 32 | 2167 | 1712 | **127%** | — |
-| 64 | 1984 | 1838 | **108%** | — |
+Single worker, `GET /` (median of 3 rounds):
 
-Pure ASGI tracks FastAPI on both servers (bridge cost, not framework cost).
-RSS on par (~48 MiB both). Single-worker CPU at conc 20: rustwasgi ~140%
-(Tokio pool + loop thread), uvicorn ~95%.
-
-Production path (Gunicorn master, 4 workers), conc 50, 10000 x 3:
-
-| server | rps (avg) | avg | p50 | p95 | p99 |
+| conc | rustwasgi rps | uvicorn rps | ratio | rw CPU | uv CPU |
 |---|---|---|---|---|---|
-| gunicorn + RustWASGIWorker | **3175** | ~14.5ms | ~13ms | ~30.7ms | ~41.4ms |
-| gunicorn + UvicornWorker | **3792** | ~12.2ms | ~10.7ms | ~26.0ms | ~35.8ms |
+| 1 | 1287 | 1290 | **100%** | 69% | 77% |
+| 2 | 1732 | 1749 | **99%** | 104% | 94% |
+| 4 | 2044 | 1938 | **105%** | 122% | 95% |
+| 8 | 2386 | 1858 | **128%** | 129% | 95% |
+| 16 | 2595 | 1882 | **138%** | 131% | 94% |
+| 20 | 2819 | 1937 | **146%** | 140% | 95% |
+| 32 | 2859 | 1821 | **157%** | 138% | 94% |
+| 64 | 2916 | 1911 | **153%** | 137% | 94% |
+| 128 | 2840 | 1826 | **156%** | 138% | 94% |
+| 256 | 2873 | 1906 | **151%** | 136% | 94% |
+
+CPU per request at conc 20 is identical (0.50ms vs 0.49ms); RSS on par
+(~47 MiB). Uvicorn saturates one core (94-95%, 1 thread, ~10 ctx switches
+total); rustwasgi spreads ~140% over 10 threads with more wakeups — same
+energy, higher ceiling on multi-core.
+
+Production path (Gunicorn master, 4 workers, `--reuse-port`):
+
+| load | rustwasgi | UvicornWorker | ratio |
+|---|---|---|---|
+| 50 conc, 1 loader | 3578 | 3792 | 94% |
+| 50 conc, 2 loaders | 5710 | 5270 | **108%** |
+| 128 conc, 4 loaders | 6925 | 4283 | **162%** |
+
+Uvicorn's single-threaded workers saturate their loops under high
+concurrency while rustwasgi workers keep scaling. Single-loader numbers
+above ~3500 rps are loader-GIL-limited, not server-limited — always verify
+high-RPS claims with parallel loader processes.
 
 Bridge microbenchmark (`_bench_bridge`: into_future round-trip ms/op at
 1/4/8/16/20/32/64 concurrency): **0.150 / 0.145 / 0.124 / 0.091 / 0.095 /
 0.086 / 0.080** — flat-to-improving, vs the old bridge's 0.083 idle →
 1.77 contended (21x blowup, gone).
 
+Profiling (`RUSTWASGI_PROFILE=1`, aggregate at shutdown): per bodyless GET —
+1 into_future, 2 Tokio spawns, 1 GIL attach, 2 bounded channel sends, 0
+feeder chunks; phases establish ~1.3ms (of which ~1.0ms is GIL acquisition
+wait, ~0.27ms holding), app_wait ~3.0ms (loop queueing + app), pump ~0.06ms.
+
 Findings, reported without spin:
 
 - Pure-ASGI ≈ FastAPI on rustwasgi ⇒ cost is bridge overhead, not the
-  framework. Single-connection service is ~0.8ms (uvicorn ~0.76ms): one
-  loop wakeup for the app submit plus scope/sink construction.
+  framework (~0.1ms of 0.8ms service).
 - A 42ms floor in early runs turned out to be Nagle/delayed-ACK (no
   `TCP_NODELAY` on the standalone socket) — fixed, 30x latency win, and a
   reminder to distrust first numbers. (Uvicorn's `--workers 4` supervisor
@@ -274,9 +295,17 @@ Findings, reported without spin:
 - A benchmark-triggered `IncompleteRead` exposed a real drain bug
   (in-flight counter dropped at response headers while the body still
   streamed); fixed with an RAII guard covering pump/WS-driver lifetime.
-- rustwasgi spends more CPU per request (thread hops + GIL transitions
-  across Tokio workers) but converts it into equal-or-better throughput at
-  concurrency ≥ 4 by never parking threads: all waits are waker-based.
+- Merging 6 per-request GIL acquisitions into 1 cut establish latency
+  ~1.9ms → ~1.3ms and lifted throughput ~40% (profile-guided, §24 table in
+  the performance report).
+- 4-worker scaling without `--reuse-port` pins up to 70% of keep-alive
+  requests on one worker (kernel accept distribution); `--reuse-port`
+  balances it. Unevenness is environmental, not a code bottleneck.
+- Access logging costs ~8% throughput when enabled (per-request formatting);
+  both workers pay it equally.
+- `RUSTWASGI_THREADS` (default: CPU count) caps Tokio workers per process;
+  2 threads match 8-thread throughput on this workload — useful against
+  oversubscription on small boxes, no behavior change otherwise.
 
 ## Security
 
