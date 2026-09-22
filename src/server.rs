@@ -424,6 +424,7 @@ fn connection_builder(keep_alive_secs: u64) -> http1::Builder {
 }
 
 async fn watch_signals(shutdown: Arc<Shutdown>, done: tokio::sync::watch::Receiver<bool>) {
+    #[allow(unused_mut)]
     let mut done = done;
     #[cfg(unix)]
     {
