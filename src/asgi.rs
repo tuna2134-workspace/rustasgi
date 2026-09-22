@@ -469,12 +469,11 @@ pub struct RequestData {
     pub server_host: String,
     pub server_port: u16,
 }
-/// Handles for one in-flight request: queue clones for feeder/pump and the
-/// application future the request task awaits directly (no monitor thread —
-/// `Err` carries the traceback in `PyErr`).
+/// Handles for one in-flight request: the queue the (inline or pump-task)
+/// feeder fills and the application future awaited directly (no monitor
+/// thread — `Err` carries the traceback in `PyErr`).
 pub struct EstablishedCall {
-    pub queue_c: Py<PyAny>,
-    pub queue_f: Py<PyAny>,
+    pub queue: Py<PyAny>,
     pub app_fut: AppFuture,
 }
 
@@ -499,8 +498,7 @@ pub async fn establish_http_call(
         // single into_future for the app. Bodyless requests pre-seed the
         // terminal message: no feeder, no queue traffic at all.
         struct Ready {
-            queue_c: Py<PyAny>,
-            queue_f: Py<PyAny>,
+            queue: Py<PyAny>,
             app_fut: AppFuture,
         }
         let ready = crate::metrics::attach_measured(|py| {
@@ -515,16 +513,13 @@ pub async fn establish_http_call(
             };
             let receive = bridge.recv_cls.bind(py).call1((queue.clone(), first))?;
             let send = bridge.send_cls.bind(py).call1((sink,))?;
-            let queue_c: Py<PyAny> = queue.clone().unbind();
-            let queue_f: Py<PyAny> = queue.unbind();
             let scope = build_http_scope(py, lifespan_state, req)?;
             let app_coro = bridge
                 .call_app_fn(py)
                 .call1((app.bind(py), scope, receive, send))?;
             let app_fut = into_future(locals, app_coro)?;
             Ok::<_, PyErr>(Ready {
-                queue_c,
-                queue_f,
+                queue: queue.unbind(),
                 app_fut,
             })
         })
@@ -534,8 +529,7 @@ pub async fn establish_http_call(
         })?;
         crate::metrics::inc(crate::metrics::C_ATTACH);
         Ok(EstablishedCall {
-            queue_c: ready.queue_c,
-            queue_f: ready.queue_f,
+            queue: ready.queue,
             app_fut: ready.app_fut,
         })
     } else {
@@ -561,21 +555,15 @@ pub async fn establish_http_call(
             Python::attach(|py| e.print(py));
             "ASGI channel init failed".to_string()
         })?;
-        let (queue_c, queue_f, receive, send): (Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>) =
-            Python::attach(|py| {
-                let (queue, receive, send): (Bound<'_, PyAny>, Bound<'_, PyAny>, Bound<'_, PyAny>) =
-                    channel.bind(py).extract()?;
-                Ok::<_, PyErr>((
-                    queue.clone().unbind(),
-                    queue.unbind(),
-                    receive.unbind(),
-                    send.unbind(),
-                ))
-            })
-            .map_err(|e| {
-                Python::attach(|py| e.print(py));
-                "ASGI channel init failed".to_string()
-            })?;
+        let (queue, receive, send): (Py<PyAny>, Py<PyAny>, Py<PyAny>) = Python::attach(|py| {
+            let (queue, receive, send): (Bound<'_, PyAny>, Bound<'_, PyAny>, Bound<'_, PyAny>) =
+                channel.bind(py).extract()?;
+            Ok::<_, PyErr>((queue.unbind(), receive.unbind(), send.unbind()))
+        })
+        .map_err(|e| {
+            Python::attach(|py| e.print(py));
+            "ASGI channel init failed".to_string()
+        })?;
         crate::metrics::inc(crate::metrics::C_ATTACH);
         // 2. Build the ASGI HTTP scope (spec_version 2.5), constructed once.
         // 3. Submit the application (ASGI 2/3 compatible wrapper).
@@ -594,11 +582,7 @@ pub async fn establish_http_call(
             "ASGI submit failed".to_string()
         })?;
         crate::metrics::inc(crate::metrics::C_ATTACH);
-        Ok(EstablishedCall {
-            queue_c,
-            queue_f,
-            app_fut,
-        })
+        Ok(EstablishedCall { queue, app_fut })
     }
 }
 

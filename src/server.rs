@@ -511,7 +511,7 @@ async fn heartbeat_loop(state: Arc<AppState>, shutdown: Arc<Shutdown>) {
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     req: Request<Incoming>,
-    state: &AppState,
+    state: &Arc<AppState>,
     client_host: &str,
     client_port: u16,
     server_host: &str,
@@ -545,7 +545,7 @@ async fn handle_request(
 #[allow(clippy::too_many_arguments)]
 async fn handle_websocket_upgrade(
     req: Request<Incoming>,
-    state: &AppState,
+    state: &Arc<AppState>,
     client_host: &str,
     client_port: u16,
     server_host: &str,
@@ -626,7 +626,7 @@ async fn handle_websocket_upgrade(
 #[allow(clippy::too_many_arguments)]
 async fn handle_http(
     req: Request<Incoming>,
-    state: &AppState,
+    state: &Arc<AppState>,
     client_host: &str,
     client_port: u16,
     server_host: &str,
@@ -704,8 +704,8 @@ async fn handle_http(
     )
     .await;
     crate::metrics::phase(crate::metrics::P_ESTABLISH, t_total);
-    let (queue_c, queue_f, app_fut) = match established {
-        Ok(call) => (call.queue_c, call.queue_f, call.app_fut),
+    let (queue, mut app_fut) = match established {
+        Ok(call) => (call.queue, call.app_fut),
         Err(e) => {
             eprintln!("ERROR rustwasgi: {e}");
             log_access(
@@ -723,79 +723,80 @@ async fn handle_http(
         }
     };
 
-    // App reaper: awaits completion directly (traceback preserved in PyErr),
-    // then releases the feeder. No monitor thread.
-    let (app_done_tx, app_done_rx) = tokio::sync::watch::channel(false);
-    {
-        crate::metrics::inc(crate::metrics::C_SPAWNS);
-        tokio::spawn(async move {
-            let t_app = crate::metrics::now();
-            let res = tokio::time::timeout(APP_COMPLETION_TIMEOUT, app_fut).await;
-            crate::metrics::phase(crate::metrics::P_APP_WAIT, t_app);
-            match res {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    Python::attach(|py| e.print(py));
-                    eprintln!("ERROR rustwasgi: ASGI application raised");
-                }
-                Err(_) => {
-                    eprintln!("ERROR rustwasgi: ASGI application timed out; dropping");
+    // Phase A (inline, no spawn): drive body feeding while awaiting response
+    // Start. One task observes body frames, app completion, and rx events
+    // together — no feeder task, no reaper task, no watch channel.
+    let app_logged = Arc::new(AtomicBool::new(false));
+    let t_app = crate::metrics::now();
+    let mut app_done = false;
+    let mut feeding = has_body;
+    let mut body_opt = has_body.then_some(body);
+    let start_deadline = tokio::time::sleep(FIRST_RESPONSE_TIMEOUT);
+    tokio::pin!(start_deadline);
+    let (status, resp_headers) = loop {
+        tokio::select! {
+            biased;
+            event = rx.recv() => {
+                match event {
+                    Some(ResponseEvent::Start { status, headers }) => break (status, headers),
+                    Some(ResponseEvent::Body { .. }) => {
+                        eprintln!("ERROR rustwasgi: app sent body before response.start");
+                        asgi::feed_disconnect(&state.bridge, &state.locals, &queue).await;
+                        spawn_drain_reaper(app_fut, t_app, app_logged.clone());
+                        return status_response(500, "Internal Server Error");
+                    }
+                    None => {
+                        // App raised before responding; traceback logged by
+                        // whoever observes completion first.
+                        log_access(
+                            state, &method, &path_for_log, &query_for_log, 500, 0,
+                            started_at.elapsed(), client_host,
+                        )
+                        .await;
+                        spawn_drain_reaper(app_fut, t_app, app_logged.clone());
+                        return status_response(500, "Internal Server Error");
+                    }
                 }
             }
-            let _ = app_done_tx.send(true);
-        });
-    }
-
-    // Request body feeder: a plain Tokio task (none spawned when bodyless —
-    // the terminal message was pre-seeded). Puts await through into_future:
-    // genuine async backpressure, zero threads.
-    if has_body {
-        let locals_c = state.locals.clone();
-        let bridge_c = state.bridge.clone();
-        crate::metrics::inc(crate::metrics::C_SPAWNS);
-        tokio::spawn(async move {
-            feed_body(body, &bridge_c, &locals_c, &queue_f, app_done_rx).await;
-        });
-    }
-
-    // Wait for response start (or app failure before start -> 500).
-    let first = tokio::time::timeout(FIRST_RESPONSE_TIMEOUT, rx.recv()).await;
-    let (status, resp_headers) = match first {
-        Ok(Some(ResponseEvent::Start { status, headers })) => (status, headers),
-        Ok(Some(ResponseEvent::Body { .. })) => {
-            eprintln!("ERROR rustwasgi: app sent body before response.start");
-            asgi::feed_disconnect(&state.bridge, &state.locals, &queue_c).await;
-            return status_response(500, "Internal Server Error");
-        }
-        Ok(None) => {
-            // App raised before responding; traceback logged by the reaper.
-            log_access(
-                state,
-                &method,
-                &path_for_log,
-                &query_for_log,
-                500,
-                0,
-                started_at.elapsed(),
-                client_host,
-            )
-            .await;
-            return status_response(500, "Internal Server Error");
-        }
-        Err(_) => {
-            eprintln!("ERROR rustwasgi: app did not respond in time; returning 500");
-            log_access(
-                state,
-                &method,
-                &path_for_log,
-                &query_for_log,
-                500,
-                0,
-                started_at.elapsed(),
-                client_host,
-            )
-            .await;
-            return status_response(500, "Internal Server Error");
+            res = &mut app_fut, if !app_done => {
+                app_done = true;
+                crate::metrics::inc(crate::metrics::C_APPDONE_A);
+                if !app_logged.swap(true, Ordering::SeqCst) {
+                    crate::metrics::phase(crate::metrics::P_APP_WAIT, t_app);
+                    match res {
+                        Ok(_) => {}
+                        Err(e) => {
+                            Python::attach(|py| e.print(py));
+                            eprintln!("ERROR rustwasgi: ASGI application raised");
+                        }
+                    }
+                }
+            }
+            fed = async {
+                match body_opt.as_mut() {
+                    Some(b) if feeding => {
+                        feed_step(b, &state.bridge, &state.locals, &queue).await
+                    }
+                    _ => std::future::pending().await,
+                }
+            } => {
+                feeding = fed;
+                if !fed {
+                    // EOF/error already delivered; drop the stream so the
+                    // responder cannot deliver a duplicate terminal.
+                    body_opt = None;
+                }
+            }
+            _ = &mut start_deadline => {
+                eprintln!("ERROR rustwasgi: app did not respond in time; returning 500");
+                log_access(
+                    state, &method, &path_for_log, &query_for_log, 500, 0,
+                    started_at.elapsed(), client_host,
+                )
+                .await;
+                spawn_drain_reaper(app_fut, t_app, app_logged.clone());
+                return status_response(500, "Internal Server Error");
+            }
         }
     };
 
@@ -822,46 +823,133 @@ async fn handle_http(
         .body(channel_body.boxed())
         .unwrap_or_else(|_| status_response(500, "Internal Server Error"));
 
-    // Response pump: forwards chunks; HEAD suppresses the wire body.
-    // It owns `guard`, so graceful drain waits for the full body.
+    // Responder: one task owns response forwarding, remaining body feeding,
+    // and app completion (reaper merged in). It holds an Arc<AppState> (no
+    // GIL refcounting) and owns `guard`, so graceful drain waits for the
+    // full body.
     {
-        let bridge_c = state.bridge.clone();
-        let locals_c = state.locals.clone();
+        let state_c = Arc::clone(state);
         let disc = disconnected.clone();
         let client_label = client_host.to_string();
-        let state_c = state_for_task(state);
+        let app_logged_c = app_logged.clone();
         crate::metrics::inc(crate::metrics::C_SPAWNS);
         let t_pump = crate::metrics::now();
         tokio::spawn(async move {
+            let app_deadline = tokio::time::sleep(APP_COMPLETION_TIMEOUT);
+            tokio::pin!(app_deadline);
             let mut sender = body_sender;
             let mut bytes_sent: u64 = 0;
-            while let Some(event) = rx.recv().await {
-                match event {
-                    ResponseEvent::Start { .. } => {
-                        eprintln!("WARN rustwasgi: duplicate response.start ignored");
-                    }
-                    ResponseEvent::Body { data, more_body } => {
-                        if !is_head && !data.is_empty() {
-                            bytes_sent += data.len() as u64;
+            let mut feeding = has_body && body_opt.is_some();
+            let mut body_opt = body_opt;
+            let mut app_done_local = app_done;
+            let mut app_fut_opt = Some(app_fut);
+            loop {
+                tokio::select! {
+                    biased;
+                    event = rx.recv() => {
+                        match event {
+                            Some(ResponseEvent::Start { .. }) => {
+                                eprintln!("WARN rustwasgi: duplicate response.start ignored");
+                            }
+                            Some(ResponseEvent::Body { data, more_body }) => {
+                                if !is_head && !data.is_empty() {
+                                    bytes_sent += data.len() as u64;
                             if sender.send_data(Bytes::from(data)).await.is_err() {
                                 // Client gone: fail fast future sends (OSError
                                 // per ASGI 2.4+) and wake a pending receive().
                                 disc.store(true, Ordering::SeqCst);
-                                asgi::feed_disconnect(&bridge_c, &locals_c, &queue_c).await;
+                                asgi::feed_disconnect(
+                                    &state_c.bridge,
+                                    &state_c.locals,
+                                    &queue,
+                                )
+                                .await;
                                 break;
                             }
-                        } else if is_head {
-                            bytes_sent += data.len() as u64;
+                                } else if is_head {
+                                    bytes_sent += data.len() as u64;
+                                }
+                                if !more_body {
+                                    break;
+                                }
+                            }
+                            None => break,
                         }
-                        if !more_body {
-                            break;
+                    }
+                    res = async {
+                        match app_fut_opt.as_mut() {
+                            Some(f) if !app_done_local => f.await,
+                            _ => std::future::pending().await,
                         }
+                    } => {
+                        app_done_local = true;
+                        crate::metrics::inc(crate::metrics::C_APPDONE_PUMP);
+                        if !app_logged_c.swap(true, Ordering::SeqCst) {
+                            crate::metrics::phase(crate::metrics::P_APP_WAIT, t_app);
+                            match res {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    Python::attach(|py| e.print(py));
+                                    eprintln!("ERROR rustwasgi: ASGI application raised");
+                                }
+                            }
+                        }
+                    }
+                    fed = async {
+                        match body_opt.as_mut() {
+                            Some(b) if feeding => {
+                                feed_step(b, &state_c.bridge, &state_c.locals, &queue).await
+                            }
+                            _ => std::future::pending().await,
+                        }
+                    } => {
+                        feeding = fed;
+                        if !fed {
+                            body_opt = None;
+                        }
+                    }
+                    _ = &mut app_deadline => {
+                        crate::metrics::inc(crate::metrics::C_APPDONE_DEADLINE);
+                        eprintln!("ERROR rustwasgi: ASGI application timed out; dropping");
+                        break;
                     }
                 }
             }
             drop(sender); // EOS (or abort if the client already went away).
+            // The loop may exit (final body / rx close) without having
+            // observed app completion (e.g. app returned right after its
+            // final send). Observe it now: rx-close implies the sink dropped,
+            // which implies the app frame is gone, so this resolves
+            // immediately in the common case. Fall back to a drain reaper
+            // rather than silently swallowing a late traceback.
+            if !app_done_local && let Some(mut f) = app_fut_opt.take() {
+                // Poll once with a noop waker: rx-close implies the sink
+                // dropped, which implies the app frame is gone, so this
+                // resolves immediately in the common case. Pending
+                // (genuinely still running) falls back to a drain reaper
+                // rather than swallowing a traceback.
+                use std::task::{Context, Poll};
+                let waker = std::task::Waker::noop();
+                let mut cx = Context::from_waker(waker);
+                match std::pin::Pin::new(&mut f).poll(&mut cx) {
+                    Poll::Ready(res) => {
+                        crate::metrics::inc(crate::metrics::C_APPDONE_NOWNOVER);
+                        if !app_logged_c.swap(true, Ordering::SeqCst) {
+                            crate::metrics::phase(crate::metrics::P_APP_WAIT, t_app);
+                            if let Err(e) = res {
+                                Python::attach(|py| e.print(py));
+                                eprintln!("ERROR rustwasgi: ASGI application raised");
+                            }
+                        }
+                    }
+                    Poll::Pending => {
+                        spawn_drain_reaper(f, t_app, app_logged_c);
+                    }
+                }
+            }
             log_access_task(
-                &state_c,
+                &state_c.hooks,
+                state_c.config.access_log,
                 &method,
                 &path_for_log,
                 &query_for_log,
@@ -880,98 +968,88 @@ async fn handle_http(
     response
 }
 
-// AppState is not Clone (Py fields need the GIL); re-clone cheaply per task.
-fn state_for_task(state: &AppState) -> TaskState {
-    TaskState {
-        hooks: state.hooks.clone_for_task(),
-        access_log: state.config.access_log,
-    }
+/// Observe a detached app future to completion for logging (Phase-A failure
+/// paths only, where no responder exists to reap). Preserves the old
+/// reaper's observability without a per-request task on the hot path.
+fn spawn_drain_reaper(
+    app_fut: crate::asgi::AppFuture,
+    t_app: std::time::Instant,
+    app_logged: Arc<AtomicBool>,
+) {
+    crate::metrics::inc(crate::metrics::C_SPAWNS);
+    tokio::spawn(async move {
+        let res = tokio::time::timeout(APP_COMPLETION_TIMEOUT, app_fut).await;
+        crate::metrics::inc(crate::metrics::C_APPDONE_REAPER);
+        if !app_logged.swap(true, Ordering::SeqCst) {
+            crate::metrics::phase(crate::metrics::P_APP_WAIT, t_app);
+            match res {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    Python::attach(|py| e.print(py));
+                    eprintln!("ERROR rustwasgi: ASGI application raised");
+                }
+                Err(_) => {
+                    eprintln!("ERROR rustwasgi: ASGI application timed out; dropping");
+                }
+            }
+        }
+    });
 }
 
-struct TaskState {
-    hooks: WorkerHooks,
-    access_log: bool,
-}
-
-/// Stream the hyper request body into the app queue, chunk by chunk, with
-/// async backpressure (`into_future` puts, never blocking). Stops when the
-/// body ends, errors, the app finishes, or shutdown trips.
-#[allow(clippy::too_many_arguments)]
-async fn feed_body(
-    body: Incoming,
+/// Feed a single body step inline (shared by Phase A and the responder).
+/// Returns false when feeding is finished (EOF sent, error, or app gone).
+async fn feed_step(
+    body: &mut Incoming,
     bridge: &Bridge,
     locals: &TaskLocals,
     queue: &Py<PyAny>,
-    mut app_done: tokio::sync::watch::Receiver<bool>,
-) {
-    let mut body = body;
-    loop {
-        if *app_done.borrow() {
-            break;
-        }
-        let frame = tokio::select! {
-            biased;
-            _ = app_done.changed() => break,
-            res = body.frame() => match res {
-                Some(Ok(f)) => Some(f),
-                Some(Err(_)) | None => None,
-            },
-        };
-        let frame = match frame {
-            Some(f) => f,
-            None => break,
-        };
-        let chunk = match frame.into_data() {
-            Ok(data) if !data.is_empty() => data.to_vec(),
-            _ => continue, // metadata frames: no trailer support, skip.
-        };
-        crate::metrics::inc(crate::metrics::C_FEED_CHUNKS);
-        // Ordered blocking-free put with backpressure; abort on app end.
-        let put = async {
-            asgi::feed_message(
+) -> bool {
+    match body.frame().await {
+        Some(Ok(f)) => match f.into_data() {
+            Ok(data) if !data.is_empty() => {
+                let chunk = data.to_vec();
+                crate::metrics::inc(crate::metrics::C_FEED_CHUNKS);
+                if asgi::feed_message(
+                    locals,
+                    queue,
+                    |py| {
+                        use pyo3::types::{PyBool, PyBytes, PyDict};
+                        let msg = PyDict::new(py);
+                        msg.set_item("type", "http.request")?;
+                        msg.set_item("body", PyBytes::new(py, &chunk))?;
+                        msg.set_item("more_body", PyBool::new(py, true))?;
+                        Ok(msg.into_any().unbind())
+                    },
+                    REQUEST_PUT_TIMEOUT,
+                )
+                .await
+                .is_err()
+                {
+                    asgi::feed_disconnect(bridge, locals, queue).await;
+                    return false;
+                }
+                true
+            }
+            _ => true, // metadata frame: no trailer support, skip.
+        },
+        _ => {
+            // EOF or error: terminal message through the same ordered path.
+            let _ = asgi::feed_message(
                 locals,
                 queue,
                 |py| {
                     use pyo3::types::{PyBool, PyBytes, PyDict};
                     let msg = PyDict::new(py);
                     msg.set_item("type", "http.request")?;
-                    msg.set_item("body", PyBytes::new(py, &chunk))?;
-                    msg.set_item("more_body", PyBool::new(py, true))?;
+                    msg.set_item("body", PyBytes::new(py, b""))?;
+                    msg.set_item("more_body", PyBool::new(py, false))?;
                     Ok(msg.into_any().unbind())
                 },
                 REQUEST_PUT_TIMEOUT,
             )
-            .await
-        };
-        tokio::select! {
-            biased;
-            _ = app_done.changed() => break,
-            res = put => {
-                if res.is_err() {
-                    // App gone or queue broken: wake a pending receive with
-                    // disconnect and stop feeding.
-                    asgi::feed_disconnect(bridge, locals, queue).await;
-                    break;
-                }
-            }
+            .await;
+            false
         }
-    }
-    // Terminal EOF through the same ordered path (unless the app is gone).
-    if !*app_done.borrow() {
-        let _ = asgi::feed_message(
-            locals,
-            queue,
-            |py| {
-                use pyo3::types::{PyBool, PyBytes, PyDict};
-                let msg = PyDict::new(py);
-                msg.set_item("type", "http.request")?;
-                msg.set_item("body", PyBytes::new(py, b""))?;
-                msg.set_item("more_body", PyBool::new(py, false))?;
-                Ok(msg.into_any().unbind())
-            },
-            REQUEST_PUT_TIMEOUT,
-        )
-        .await;
     }
 }
 
@@ -1022,7 +1100,8 @@ async fn log_access(
 
 #[allow(clippy::too_many_arguments)]
 async fn log_access_task(
-    state: &TaskState,
+    hooks: &WorkerHooks,
+    access_log: bool,
     method: &str,
     path: &str,
     query: &str,
@@ -1032,10 +1111,10 @@ async fn log_access_task(
     client: &str,
 ) {
     // Fast path: no hook and no stderr log means zero GIL interaction.
-    if state.hooks.access.is_none() && !state.access_log {
+    if hooks.access.is_none() && !access_log {
         return;
     }
-    let hook = Python::attach(|py| crate::runtime::clone_opt_py(py, &state.hooks.access));
+    let hook = Python::attach(|py| crate::runtime::clone_opt_py(py, &hooks.access));
     let (method, path, query, client) = (
         method.to_string(),
         path.to_string(),
@@ -1043,7 +1122,7 @@ async fn log_access_task(
         client.to_string(),
     );
     let duration_ms = duration.as_secs_f64() * 1000.0;
-    let enabled = state.access_log;
+    let enabled = access_log;
     if let Some(access) = hook {
         let status_u = status as u64;
         Python::attach(|py| {

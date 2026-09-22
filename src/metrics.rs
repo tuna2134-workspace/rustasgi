@@ -38,7 +38,7 @@ pub const PHASE_NAMES: [&str; N_PHASES] = [
 
 // Counters: requests, tokio spawns, into_future calls, send fast/full,
 // GIL attaches (hot path), feeder chunks.
-pub const N_COUNTERS: usize = 7;
+pub const N_COUNTERS: usize = 12;
 pub const C_REQUESTS: usize = 0;
 pub const C_SPAWNS: usize = 1;
 pub const C_INTO_FUTURE: usize = 2;
@@ -46,6 +46,11 @@ pub const C_SEND_FAST: usize = 3;
 pub const C_SEND_FULL: usize = 4;
 pub const C_ATTACH: usize = 5;
 pub const C_FEED_CHUNKS: usize = 6;
+pub const C_APPDONE_A: usize = 7;
+pub const C_APPDONE_PUMP: usize = 8;
+pub const C_APPDONE_NOWNOVER: usize = 9;
+pub const C_APPDONE_REAPER: usize = 10;
+pub const C_APPDONE_DEADLINE: usize = 11;
 
 pub const COUNTER_NAMES: [&str; N_COUNTERS] = [
     "requests",
@@ -55,6 +60,11 @@ pub const COUNTER_NAMES: [&str; N_COUNTERS] = [
     "send_full_wait",
     "gil_attach",
     "feed_chunks",
+    "appdone_phase_a",
+    "appdone_pump",
+    "appdone_now_or_never",
+    "appdone_reaper",
+    "appdone_deadline",
 ];
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -82,6 +92,11 @@ static COUNTERS: [AtomicU64; N_COUNTERS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 
 /// True when `RUSTWASGI_PROFILE=1` (report enabled).
@@ -92,7 +107,12 @@ pub fn enabled() -> bool {
 
 #[inline]
 pub fn inc(counter: usize) {
-    COUNTERS[counter].fetch_add(1, Ordering::Relaxed);
+    // Gated so unprofiled runs pay nothing (a single predictable branch);
+    // profiled runs get complete counts. This makes "metrics disabled" the
+    // default benchmark configuration with no feature-flag rebuild needed.
+    if enabled() {
+        COUNTERS[counter].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Record elapsed nanoseconds for a phase (no-op unless profiling).

@@ -241,24 +241,24 @@ Same app (`examples/bench_app.py`, `{"ok": true}`), same box (8 cores),
 Run: `.venv/bin/python bench/bench.py --servers standalone,uvicorn
 --levels 1,2,4,8,16,20,32,64,128,256 --rounds 3 --json out.json`
 
-Single worker, `GET /` (median of 3 rounds):
+Single worker, `GET /` (median of 3 rounds, same-session back-to-back):
 
 | conc | rustwasgi rps | uvicorn rps | ratio | rw CPU | uv CPU |
 |---|---|---|---|---|---|
-| 1 | 1287 | 1290 | **100%** | 69% | 77% |
-| 2 | 1732 | 1749 | **99%** | 104% | 94% |
-| 4 | 2044 | 1938 | **105%** | 122% | 95% |
-| 8 | 2386 | 1858 | **128%** | 129% | 95% |
-| 16 | 2595 | 1882 | **138%** | 131% | 94% |
-| 20 | 2819 | 1937 | **146%** | 140% | 95% |
-| 32 | 2859 | 1821 | **157%** | 138% | 94% |
-| 64 | 2916 | 1911 | **153%** | 137% | 94% |
-| 128 | 2840 | 1826 | **156%** | 138% | 94% |
-| 256 | 2873 | 1906 | **151%** | 136% | 94% |
+| 1 | 1424 | 1253 | **114%** | 75% | 77% |
+| 2 | 2549 | 1933 | **132%** | — | — |
+| 4 | 2535 | 1849 | **137%** | — | — |
+| 8 | 2813 | 1934 | **145%** | — | — |
+| 16 | 3264 | 2047 | **159%** | — | — |
+| 20 | 3159 | 1945 | **162%** | 131% | 95% |
+| 32 | 3083 | 1971 | **156%** | — | — |
+| 64 | 3280 | 2000 | **164%** | — | — |
+| 128 | 3201 | 1879 | **170%** | — | — |
+| 256 | 3329 | 1919 | **173%** | — | — |
 
 CPU per request at conc 20 is identical (0.50ms vs 0.49ms); RSS on par
 (~47 MiB). Uvicorn saturates one core (94-95%, 1 thread, ~10 ctx switches
-total); rustwasgi spreads ~140% over 10 threads with more wakeups — same
+total); rustwasgi spreads ~130% over 10 threads with more wakeups — same
 energy, higher ceiling on multi-core.
 
 Production path (Gunicorn master, 4 workers, `--reuse-port`):
@@ -267,7 +267,7 @@ Production path (Gunicorn master, 4 workers, `--reuse-port`):
 |---|---|---|---|
 | 50 conc, 1 loader | 3578 | 3792 | 94% |
 | 50 conc, 2 loaders | 5710 | 5270 | **108%** |
-| 128 conc, 4 loaders | 6925 | 4283 | **162%** |
+| 128 conc, 4 loaders | 7939 | 6250 | **127%** |
 
 Uvicorn's single-threaded workers saturate their loops under high
 concurrency while rustwasgi workers keep scaling. Single-loader numbers
@@ -280,9 +280,12 @@ Bridge microbenchmark (`_bench_bridge`: into_future round-trip ms/op at
 1.77 contended (21x blowup, gone).
 
 Profiling (`RUSTWASGI_PROFILE=1`, aggregate at shutdown): per bodyless GET —
-1 into_future, 2 Tokio spawns, 1 GIL attach, 2 bounded channel sends, 0
+1 into_future, 1 Tokio spawn, 1 GIL attach, 2 bounded channel sends, 0
 feeder chunks; phases establish ~1.3ms (of which ~1.0ms is GIL acquisition
-wait, ~0.27ms holding), app_wait ~3.0ms (loop queueing + app), pump ~0.06ms.
+wait, ~0.27ms holding), app_wait ~3.0-3.8ms (loop queueing + app), pump
+~0.06ms. Uncontended (conc 1): establish 0.10ms (wait 0.007ms), app_wait
+0.34ms — contention inflates every handoff ~10x, which is why oversubscription
+matters more than per-operation cost here.
 
 Findings, reported without spin:
 
@@ -296,8 +299,13 @@ Findings, reported without spin:
   (in-flight counter dropped at response headers while the body still
   streamed); fixed with an RAII guard covering pump/WS-driver lifetime.
 - Merging 6 per-request GIL acquisitions into 1 cut establish latency
-  ~1.9ms → ~1.3ms and lifted throughput ~40% (profile-guided, §24 table in
-  the performance report).
+  ~1.9ms → ~1.3ms and lifted throughput ~40% (profile-guided).
+- Merging reaper+pump+feeder into one responder task cut spawns 2→1/req and
+  removed the app_done watch channel; post-send app completion is observed
+  via noop-waker poll with drain-reaper fallback (no swallowed tracebacks).
+- Passing `Arc<AppState>` into the responder (instead of cloning Bridge and
+  hooks per request) removed 2 more GIL acquisitions and cut cross-thread
+  wakeups ~38% at conc 20.
 - 4-worker scaling without `--reuse-port` pins up to 70% of keep-alive
   requests on one worker (kernel accept distribution); `--reuse-port`
   balances it. Unevenness is environmental, not a code bottleneck.
