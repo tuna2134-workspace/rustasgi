@@ -270,6 +270,7 @@ pub async fn serve(
                         .await;
                     }
                 }
+                #[cfg(unix)]
                 BoundListener::Unix {
                     listener,
                     path,

@@ -19,20 +19,32 @@
 //! its FD and because the Python `socket` object may be closed by Gunicorn
 //! while Rust is still serving.
 //!
-//! Supported families: IPv4 TCP, IPv6 TCP, Unix domain sockets.
+//! Supported families: IPv4 TCP, IPv6 TCP, Unix domain sockets (unix only).
 
 use std::net::SocketAddr;
-use std::os::fd::{FromRawFd, OwnedFd};
 
-use tokio::net::{TcpListener, UnixListener};
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawSocket, OwnedSocket};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 /// One inherited listening socket, as passed from Python.
 #[derive(Debug)]
 pub struct InheritedSocket {
     /// `"tcp4"`, `"tcp6"` or `"unix"`.
     pub family: String,
+    #[cfg(unix)]
     /// A **duplicated** FD owned by this process (see module docs).
     pub fd: OwnedFd,
+    #[cfg(windows)]
+    /// A **duplicated** socket owned by this process (Windows).
+    pub fd: OwnedSocket,
+    #[cfg(not(any(unix, windows)))]
+    /// Fallback: raw fd stored, not owned.
+    pub fd: i32,
     /// Human description for logs (e.g. `"http://127.0.0.1:8000"`).
     pub description: String,
 }
@@ -44,12 +56,36 @@ impl InheritedSocket {
     /// The caller must guarantee `fd` is a valid, uniquely-owned (dup'd)
     /// socket FD of the stated family. Misuse (wrong family, double ownership)
     /// is memory-safe but will produce errors or close the wrong FD.
+    #[cfg(unix)]
     pub unsafe fn from_raw(family: String, fd: i32, description: String) -> Self {
         // SAFETY: upheld by the contract above; the FD comes from os.dup().
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         Self {
             family,
             fd: owned,
+            description,
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn from_raw(family: String, fd: i32, description: String) -> Self {
+        use std::os::windows::io::RawSocket;
+        // SAFETY: upheld by the contract above; the FD comes from os.dup().
+        // On Windows, sockets are RawSocket (usize), but Python's os.dup for sockets
+        // duplicates the underlying SOCKET handle which fits in RawSocket.
+        let owned = unsafe { OwnedSocket::from_raw_socket(fd as RawSocket) };
+        Self {
+            family,
+            fd: owned,
+            description,
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub unsafe fn from_raw(family: String, fd: i32, description: String) -> Self {
+        Self {
+            family,
+            fd,
             description,
         }
     }
@@ -62,6 +98,7 @@ pub enum BoundListener {
         local: SocketAddr,
         description: String,
     },
+    #[cfg(unix)]
     Unix {
         listener: UnixListener,
         path: String,
@@ -80,51 +117,93 @@ impl BoundListener {
 
 /// Convert inherited sockets into Tokio listeners (non-blocking mode set).
 pub fn bind_inherited(sockets: Vec<InheritedSocket>) -> Result<Vec<BoundListener>, String> {
-    use std::os::fd::IntoRawFd;
-
     let mut out = Vec::with_capacity(sockets.len());
     for sock in sockets {
         match sock.family.as_str() {
             "tcp4" | "tcp6" | "tcp" => {
-                let raw = sock.fd.into_raw_fd();
-                // SAFETY: we just took ownership back from OwnedFd; the FD is
-                // a valid listening TCP socket (dup'd by the parent).
-                let std_listener: std::net::TcpListener =
-                    unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) };
-                std_listener
-                    .set_nonblocking(true)
-                    .map_err(|e| format!("failed to set nonblocking: {e}"))?;
-                let local = std_listener
-                    .local_addr()
-                    .map_err(|e| format!("getsockname failed: {e}"))?;
-                let listener = TcpListener::from_std(std_listener)
-                    .map_err(|e| format!("tokio TcpListener failed: {e}"))?;
-                out.push(BoundListener::Tcp {
-                    listener,
-                    local,
-                    description: sock.description,
-                });
+                #[cfg(unix)]
+                {
+                    use std::os::fd::IntoRawFd;
+                    let raw = sock.fd.into_raw_fd();
+                    // SAFETY: we just took ownership back from OwnedFd; the FD is
+                    // a valid listening TCP socket (dup'd by the parent).
+                    let std_listener: std::net::TcpListener =
+                        unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) };
+                    std_listener
+                        .set_nonblocking(true)
+                        .map_err(|e| format!("failed to set nonblocking: {e}"))?;
+                    let local = std_listener
+                        .local_addr()
+                        .map_err(|e| format!("getsockname failed: {e}"))?;
+                    let listener = TcpListener::from_std(std_listener)
+                        .map_err(|e| format!("tokio TcpListener failed: {e}"))?;
+                    out.push(BoundListener::Tcp {
+                        listener,
+                        local,
+                        description: sock.description,
+                    });
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::IntoRawSocket;
+                    let raw = sock.fd.into_raw_socket();
+                    // SAFETY: we just took ownership back from OwnedSocket; the FD is
+                    // a valid listening TCP socket (dup'd by the parent).
+                    let std_listener: std::net::TcpListener =
+                        unsafe { std::os::windows::io::FromRawSocket::from_raw_socket(raw) };
+                    std_listener
+                        .set_nonblocking(true)
+                        .map_err(|e| format!("failed to set nonblocking: {e}"))?;
+                    let local = std_listener
+                        .local_addr()
+                        .map_err(|e| format!("getsockname failed: {e}"))?;
+                    let listener = TcpListener::from_std(std_listener)
+                        .map_err(|e| format!("tokio TcpListener failed: {e}"))?;
+                    out.push(BoundListener::Tcp {
+                        listener,
+                        local,
+                        description: sock.description,
+                    });
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    return Err(format!(
+                        "unsupported platform for tcp sockets: {}",
+                        sock.description
+                    ));
+                }
             }
             "unix" => {
-                let raw = sock.fd.into_raw_fd();
-                // SAFETY: same contract as above, for a Unix socket.
-                let std_listener: std::os::unix::net::UnixListener =
-                    unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) };
-                std_listener
-                    .set_nonblocking(true)
-                    .map_err(|e| format!("failed to set nonblocking: {e}"))?;
-                let path = std_listener
-                    .local_addr()
-                    .ok()
-                    .and_then(|a| a.as_pathname().map(|p| p.display().to_string()))
-                    .unwrap_or_else(|| "<unnamed unix socket>".to_string());
-                let listener = UnixListener::from_std(std_listener)
-                    .map_err(|e| format!("tokio UnixListener failed: {e}"))?;
-                out.push(BoundListener::Unix {
-                    listener,
-                    path,
-                    description: sock.description,
-                });
+                #[cfg(unix)]
+                {
+                    use std::os::fd::IntoRawFd;
+                    let raw = sock.fd.into_raw_fd();
+                    // SAFETY: same contract as above, for a Unix socket.
+                    let std_listener: std::os::unix::net::UnixListener =
+                        unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) };
+                    std_listener
+                        .set_nonblocking(true)
+                        .map_err(|e| format!("failed to set nonblocking: {e}"))?;
+                    let path = std_listener
+                        .local_addr()
+                        .ok()
+                        .and_then(|a| a.as_pathname().map(|p| p.display().to_string()))
+                        .unwrap_or_else(|| "<unnamed unix socket>".to_string());
+                    let listener = UnixListener::from_std(std_listener)
+                        .map_err(|e| format!("tokio UnixListener failed: {e}"))?;
+                    out.push(BoundListener::Unix {
+                        listener,
+                        path,
+                        description: sock.description,
+                    });
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(format!(
+                        "unsupported socket family unix on this platform: {}",
+                        sock.description
+                    ));
+                }
             }
             other => {
                 return Err(format!(
